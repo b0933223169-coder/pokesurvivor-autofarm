@@ -2,7 +2,7 @@
 // @name         PokéSurvivor 自動掛機 (PSBot)
 // @name:en      PokéSurvivor Auto-Farm (PSBot)
 // @namespace    https://github.com/b0933223169-coder/pokesurvivor-autofarm
-// @version      1.8.17
+// @version      1.8.18
 // @description  PokéSurvivor 自動走位躲招、選卡、綁羈絆、進神祕裂縫、處理事件（Gholdengo、求救、祭壇…）、自動再開一局
 // @description:en Auto movement & dodging, card picks, bonds, rifts, events (Gholdengo, rescues, altars…) and auto restart for PokéSurvivor
 // @author       BoundlessEgret
@@ -39,7 +39,7 @@
   try { Object.defineProperty(window, GUARD, { value: 1, configurable: true }); } catch { window[GUARD] = 1; }
 
   const STORE_KEY = 'psbot.v1';
-  const VERSION = '1.8.17';   // 改程式時記得跟 manifest.json 一起改，面板標題會顯示，用來確認瀏覽器跑的是不是新版
+  const VERSION = '1.8.18';   // 改程式時記得跟 manifest.json 一起改，面板標題會顯示，用來確認瀏覽器跑的是不是新版
   const log = (...a) => console.log('%c[PSBot]', 'color:#ff8ad8', ...a);
   let capturedNs = null;
 
@@ -236,7 +236,7 @@
   // ---------- 3. 主程式 ----------
   function boot(ns) {
     // 除錯用：放在 Symbol 下，不可列舉，避免 window 上的明字鍵名觸發偵測
-    try { Object.defineProperty(window, Symbol.for('psbot.debug'), { value: { ns, cfg, stats }, configurable: true }); } catch {}
+    try { Object.defineProperty(window, Symbol.for('psbot.debug'), { value: { ns, cfg, stats, S }, configurable: true }); } catch {}
     log('namespace captured, version', VERSION);
     // 核心模組都認出來、DOM 也好了才 patch。其他模組晚一點就緒沒關係（用到的地方都有防護）。
     const need = ['Game', 'Input', 'RunUI', 'LevelUp', 'Moves', 'DEX_BY', 'UI', 'T'];
@@ -255,7 +255,7 @@
     }, 50);
   }
 
-  const S = { pickTimer: null, lastPos: null, stuckT: 0, unstickT: 0, unstickDir: null, wanderA: Math.random() * 6.28, lastSlotCheck: 0, lastOrb: 0, lastT: performance.now(), overAt: -1e9, againAt: -1e9, lobbyAt: -1e9, lastPlay: -1e9, pausedAt: 0, userPausedAt: -1e9, lastDir: null, lastOffer: null, orbGoal: null, plan: null, seen: {}, ban: {}, noGo: {}, jCenter: null, holding: false, holdKey: null, holdSince: 0, wd: null, losBadT: 0, spin: 1, spinBlockT: 0, loopC: null, dirIdx: -1, holdT: 0, out: [1, 0] };
+  const S = { pickTimer: null, lastPos: null, stuckT: 0, unstickT: 0, unstickDir: null, wanderA: Math.random() * 6.28, lastSlotCheck: 0, lastOrb: 0, lastT: performance.now(), overAt: -1e9, againAt: -1e9, lobbyAt: -1e9, coopFull: true, fullLogAt: -1e9, lastPlay: -1e9, pausedAt: 0, userPausedAt: -1e9, lastDir: null, lastOffer: null, orbGoal: null, plan: null, seen: {}, ban: {}, noGo: {}, jCenter: null, holding: false, holdKey: null, holdSince: 0, wd: null, losBadT: 0, spin: 1, spinBlockT: 0, loopC: null, dirIdx: -1, holdT: 0, out: [1, 0] };
 
   function patch(ns) {
     // --- 走位：接管 Input.axis()，玩家自己按方向鍵時讓玩家優先 ---
@@ -330,7 +330,15 @@
     trackHazards(ns);
 
     // --- 每 200ms 的雜務：切換主動欄位、用寶珠、自動再開一局、被暫停就繼續 ---
-    setInterval(() => { if (cfg.on) try { housekeeping(ns); autoGacha(ns); autoPartner(ns); autoUpgrade(ns); autoRestart(ns); autoResume(ns); } catch (e) { console.warn('[PSBot] tick', e); } }, 200);
+    // coopFull：多人第一次開局要等房間滿。關掉 bot 就重置，下次開啟重新要求滿房。
+    setInterval(() => {
+      if (!cfg.on) { S.coopFull = true; return; }
+      try {
+        // 已經進場（不管是 bot 開的還是你手動開的）→ 這一輪就沿用這個組合，之後不再要求滿房
+        if (ns.Room && ns.Room.room && ns.Game.state === 'playing') S.coopFull = false;
+        housekeeping(ns); autoGacha(ns); autoPartner(ns); autoUpgrade(ns); autoRestart(ns); autoResume(ns);
+      } catch (e) { console.warn('[PSBot] tick', e); }
+    }, 200);
     log('patched');
   }
 
@@ -1582,6 +1590,21 @@
     // 遊戲自己會把 lobby-start 隱藏（訪客）或 disable（人數不足 / 有人還在連線），照它的判斷走就好。
     if (open('scr-lobby')) {
       const btn = document.getElementById('lobby-start');
+      const room = ns.Room && ns.Room.room;
+      // 第一次（bot 剛開啟）一定要等房間滿才自動開：邀請好友時房間已經存在，
+      // 如果不等滿，房主會自己一個人進去，朋友就只能在房間乾等。
+      // 只要進過一次場（bot 開的或你手動開的），這一輪就沿用當時的組合，之後照當下人數直接開。
+      if (S.coopFull && room && room.isHost) {
+        const cap = ns.Room.MAX_PLAYERS || 4;
+        const n = room.members ? room.members.length : 0;
+        if (n < cap) {
+          if (now() - (S.fullLogAt || 0) > 10000) {
+            S.fullLogAt = now();
+            log(`co-op: waiting for full room (${n}/${cap})`);
+          }
+          return;
+        }
+      }
       if (btn && !btn.classList.contains('hidden') && !btn.disabled && now() - (S.lobbyAt || 0) > 5000) {
         S.lobbyAt = now();
         btn.click();
