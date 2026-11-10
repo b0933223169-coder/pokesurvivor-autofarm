@@ -19,7 +19,7 @@
   try { Object.defineProperty(window, GUARD, { value: 1, configurable: true }); } catch { window[GUARD] = 1; }
 
   const STORE_KEY = 'psbot.v1';
-  const VERSION = '2.0.0';   // v2：outcome-aware 學習（依局品質加權）+ 參數面板 + 儀表板
+  const VERSION = '3.0.0';   // v3：知識圖譜（腦）— 所有參數都是節點，Hebbian 學習，Canvas 視覺化，匯出/匯入
   const log = (...a) => console.log('%c[PSBot]', 'color:#ff8ad8', ...a);
   let capturedNs = null;
 
@@ -195,6 +195,21 @@
     // 記錄模式：由你自己打，bot 完全不介入，只記錄你選了哪些卡 / 羈絆 / 道具、走位離怪多遠、血壓多低。
     // 停止記錄後，下一局開始自動判斷就會參考這些偏好（參數會一直累積，可匯出 / 匯入）
     record: false,
+    // 走位 / 戰鬥的可調參數（原本硬寫在 steer()，現在全部進入知識圖譜，可學習 / 匯出 / 匯入）
+    steer: {
+      fearLow: null, fearMid: null, fearK: null,          // 由學習覆寫
+      retreatDist: 120,    // 首領/彈幕迴避距離
+      springHp: 0.6,       // 補血泉觸發血量
+      farmMinEnemies: 54,  // 養怪最少怪數
+      farmHpOn: 0.65,      // 養怪開啟血量
+      farmHpOff: 0.45,     // 養怪關閉血量
+      orbHp: 0.35,         // 寶珠使用血量
+      healCardHp: 0.35,    // 補血卡門檻（備援）
+      magnetBase: 78,      // 磁鐵基礎半徑
+      xpWeight: 74, atkWeight: 60, cdWeight: 55,         // 選卡權重
+    },
+    // 知識圖譜（腦）：所有參數都是節點，關係是邊
+    brain: { v: 1, nodes: {}, edges: [], updatedAt: 0 },
     learn: {
       v: 2,             // v2：加入 outcome-aware 學習（依局數品質加權）
       runs: 0,          // 總共記錄了幾局
@@ -236,6 +251,10 @@
   cfg.learn.params = Object.assign({}, DEFAULTS.learn.params, cfg.learn.params || {});
   cfg.learn.params.locked = Object.assign({}, cfg.learn.params.locked || {});
   if (!Array.isArray(cfg.learn.history)) cfg.learn.history = [];
+  cfg.steer = Object.assign({}, DEFAULTS.steer, cfg.steer || {});
+  cfg.brain = Object.assign({ v: 1, nodes: {}, edges: [], updatedAt: 0 }, cfg.brain || {});
+  if (!cfg.brain.nodes || typeof cfg.brain.nodes !== 'object') cfg.brain.nodes = {};
+  if (!Array.isArray(cfg.brain.edges)) cfg.brain.edges = [];
   // 舊版內建的妙蛙種子 / 蓋歐卡配置不符合「開局招式 → 變硬 → 劍舞 / 詭計 → 範圍攻擊」，存檔裡還是原樣的就刪掉，改走自動模式
   for (const [dex, old] of Object.entries({ 1: 'energy-ball,nasty-plot,leaf-storm,giga-drain', 382: 'bubble,nasty-plot,aqua-ring,hydro-pump' }))
     if (cfg.profiles[dex] && (cfg.profiles[dex].moves || []).join() === old) delete cfg.profiles[dex];
@@ -248,7 +267,7 @@
   // ---------- 3. 主程式 ----------
   function boot(ns) {
     // 除錯用：放在 Symbol 下，不可列舉，避免 window 上的明字鍵名觸發偵測
-    try { Object.defineProperty(window, Symbol.for('psbot.debug'), { value: { ns, cfg, stats, S, learn: { exportLearn, importLearnFile, mergeLearn, resetLearn, cardBias, bondBias, itemBias, learnedMove, fearModel, healThreshold } }, configurable: true }); } catch {}
+    try { Object.defineProperty(window, Symbol.for('psbot.debug'), { value: { ns, cfg, stats, S, learn: { exportLearn, importLearnFile, mergeLearn, resetLearn, cardBias, bondBias, itemBias, learnedMove, fearModel, healThreshold }, brain: { buildBrain, adaptBrain, exportBrain, importBrainFile, brainGet, brainSet, PARAM_REGISTRY } }, configurable: true }); } catch {}
     log('namespace captured, version', VERSION);
     // 核心模組都認出來、DOM 也好了才 patch。其他模組晚一點就緒沒關係（用到的地方都有防護）。
     const need = ['Game', 'Input', 'RunUI', 'LevelUp', 'Moves', 'DEX_BY', 'UI', 'T'];
@@ -536,6 +555,13 @@
       const target = Math.max(0.25, Math.min(0.6, (S.rec.runMin || 0.35) * 1.1));
       if (!(P.locked && P.locked.healThr)) P.healThr = P.healThr == null ? target : P.healThr * 0.85 + target * 0.15;
     }
+    // 知識圖譜：Hebbian + 獎勵調變更新
+    const activeIds = []
+      .concat(S.rec.runCards.map(k => 'pref:cards:' + k))
+      .concat(S.rec.runBonds.map(k => 'pref:bonds:' + k))
+      .concat(S.rec.runItems.map(k => 'pref:items:' + k))
+      .concat(['steer.fearLow', 'steer.fearMid', 'steer.fearK', 'learn.healThr', 'steer.orbHp']);
+    try { adaptBrain(q, activeIds); } catch (e) { console.warn('[PSBot] adaptBrain', e); }
     // 局歷史
     if (!Array.isArray(L.history)) L.history = [];
     L.history.push({ at: Date.now(), time: d.time || 0, level: d.level || 0, kills: d.kills || 0, q,
@@ -684,6 +710,353 @@
     cfg.learn = JSON.parse(JSON.stringify(DEFAULTS.learn));
     save();
     learnMsg('已清除學習參數');
+  }
+
+  // ---------- 3c. 知識圖譜（腦）：所有參數都是節點，關係是邊 ----------
+  // 參數註冊表：每一個可調參數（cfg / learn / steer）都是知識圖譜的一個節點。
+  // humanTrackable: 是否能從人類遊玩中自動推導；humanSource: 推導來源欄位。
+  const PARAM_REGISTRY = [
+    // --- 核心開關 ---
+    { id: 'cfg.on', label: 'bot 開關', cat: 'core', type: 'bool', def: false, desc: '總開關' },
+    { id: 'cfg.move', label: '自動走位', cat: 'core', type: 'bool', def: true, desc: '接管移動' },
+    { id: 'cfg.cards', label: '自動選卡', cat: 'core', type: 'bool', def: true, desc: '升級選卡' },
+    { id: 'cfg.bonds', label: '自動羈絆', cat: 'core', type: 'bool', def: true, desc: '羈絆選擇' },
+    { id: 'cfg.items', label: '自動道具', cat: 'core', type: 'bool', def: true, desc: '攜帶道具' },
+    { id: 'cfg.rift', label: '自動進裂縫', cat: 'core', type: 'bool', def: true, desc: '羈絆來源' },
+    { id: 'cfg.orbs', label: '自動用寶珠', cat: 'core', type: 'bool', def: true, desc: '危急/首領' },
+    { id: 'cfg.restart', label: '自動再來', cat: 'core', type: 'bool', def: true, desc: '結束後重開' },
+    { id: 'cfg.noRank', label: '不上排行榜', cat: 'core', type: 'bool', def: true, desc: '掛機不上榜' },
+    { id: 'cfg.farm', label: '養怪模式', cat: 'core', type: 'bool', def: true, desc: '繞圈聚怪' },
+    { id: 'cfg.focus', label: '集火瞄準', cat: 'core', type: 'bool', def: true, desc: '單體優先' },
+    { id: 'cfg.passiveFirst', label: '被動優先', cat: 'core', type: 'bool', def: true, desc: '被動>招式' },
+    { id: 'cfg.record', label: '記錄模式', cat: 'core', type: 'bool', def: false, desc: '人類示範' },
+    // --- 移動 / 戰鬥 ---
+    { id: 'steer.fearLow', label: '恐懼門檻(低血)', cat: 'movement', type: 'number', def: 0.35, min: 0.15, max: 0.6, step: 0.01, humanTrackable: true, humanSource: 'learn.params.fearLow', desc: '低血量時恐懼係數切換點' },
+    { id: 'steer.fearMid', label: '恐懼門檻(中血)', cat: 'movement', type: 'number', def: 0.6, min: 0.4, max: 0.8, step: 0.01, humanTrackable: true, humanSource: 'learn.params.fearMid', desc: '中血量時恐懼係數切換點' },
+    { id: 'steer.fearK', label: '恐懼倍率', cat: 'movement', type: 'number', def: 1.0, min: 0.5, max: 1.8, step: 0.01, humanTrackable: true, humanSource: 'learn.params.fearK', desc: '整體恐懼放大/縮小' },
+    { id: 'steer.retreatDist', label: '迴避距離', cat: 'movement', type: 'number', def: 120, min: 60, max: 240, step: 5, desc: '首領/彈幕迴避距離' },
+    { id: 'steer.springHp', label: '補血泉觸發血量', cat: 'movement', type: 'number', def: 0.6, min: 0.3, max: 0.9, step: 0.05, humanTrackable: true, humanSource: 'learn.healThreshold', desc: '低於此血量走向補血泉' },
+    { id: 'steer.farmMinEnemies', label: '養怪最少怪數', cat: 'movement', type: 'number', def: 54, min: 20, max: 80, step: 1, desc: '場上怪數達此值新生精英' },
+    { id: 'steer.farmHpOn', label: '養怪開啟血量', cat: 'movement', type: 'number', def: 0.65, min: 0.4, max: 0.9, step: 0.05, desc: '血量高於此開養怪' },
+    { id: 'steer.farmHpOff', label: '養怪關閉血量', cat: 'movement', type: 'number', def: 0.45, min: 0.2, max: 0.7, step: 0.05, desc: '血量低於此關養怪' },
+    { id: 'steer.orbHp', label: '寶珠使用血量', cat: 'movement', type: 'number', def: 0.35, min: 0.1, max: 0.7, step: 0.05, humanTrackable: true, humanSource: 'learn.healThreshold', desc: '危急時用寶珠' },
+    { id: 'steer.healCardHp', label: '補血卡門檻', cat: 'movement', type: 'number', def: 0.35, min: 0.2, max: 0.7, step: 0.01, humanTrackable: true, humanSource: 'learn.healThreshold', desc: 'bot 選補血卡的血量' },
+    { id: 'steer.magnetBase', label: '磁鐵基礎半徑', cat: 'movement', type: 'number', def: 78, min: 40, max: 120, step: 2, desc: '吸取半徑' },
+    // --- 學習強度 ---
+    { id: 'learn.cardStr', label: '卡牌偏好強度', cat: 'learning', type: 'number', def: 400, min: 0, max: 800, step: 10, humanTrackable: true, humanSource: 'learn.params.cardStr', desc: '卡牌 bias 放大倍率' },
+    { id: 'learn.bondStr', label: '羈絆偏好強度', cat: 'learning', type: 'number', def: 6, min: 0, max: 12, step: 0.5, humanTrackable: true, humanSource: 'learn.params.bondStr', desc: '羈絆 bias 放大倍率' },
+    { id: 'learn.itemStr', label: '道具偏好強度', cat: 'learning', type: 'number', def: 6, min: 0, max: 12, step: 0.5, humanTrackable: true, humanSource: 'learn.params.itemStr', desc: '道具 bias 放大倍率' },
+    { id: 'learn.healThr', label: '學習補血門檻', cat: 'learning', type: 'number', def: 0.35, min: 0.2, max: 0.7, step: 0.01, humanTrackable: true, humanSource: 'learn.params.healThr', desc: 'outcome-aware 推導' },
+    // --- 選卡權重 ---
+    { id: 'score.xpWeight', label: 'XP 卡權重', cat: 'scoring', type: 'number', def: 74, min: 0, max: 100, step: 1, desc: '經驗卡優先度' },
+    { id: 'score.atkWeight', label: '攻擊卡權重', cat: 'scoring', type: 'number', def: 60, min: 0, max: 100, step: 1, desc: '攻擊卡優先度' },
+    { id: 'score.cdWeight', label: '冷卻卡權重', cat: 'scoring', type: 'number', def: 55, min: 0, max: 100, step: 1, desc: '冷卻卡優先度' },
+    { id: 'score.passiveFirst', label: '被動優先分數', cat: 'scoring', type: 'number', def: 400, min: 200, max: 700, step: 10, desc: '被動 vs 招式升級' },
+    // --- 知識圖譜超參數 ---
+    { id: 'brain.emaLr', label: '學習率(EMA)', cat: 'brain', type: 'number', def: 0.15, min: 0.01, max: 0.5, step: 0.01, desc: 'Hebbian 更新速率' },
+    { id: 'brain.decay', label: '衰減率', cat: 'brain', type: 'number', def: 0.85, min: 0.5, max: 0.99, step: 0.01, desc: 'EMA 舊值保留率' },
+    { id: 'brain.minEvidence', label: '最小證據數', cat: 'brain', type: 'number', def: 3, min: 1, max: 10, step: 1, desc: '生效所需樣本' },
+    { id: 'brain.historySize', label: '歷史局數', cat: 'brain', type: 'number', def: 30, min: 10, max: 100, step: 5, desc: '保留局數' },
+  ];
+  const BRAIN_CATS = ['core', 'movement', 'learning', 'scoring', 'brain'];
+  const BRAIN_CAT_LABEL = { core: '核心開關', movement: '移動/戰鬥', learning: '學習強度', scoring: '選卡評分', brain: '腦超參數' };
+
+  // 取得參數當前值（依 id 路徑）
+  function brainGet(id) {
+    const parts = id.split('.');
+    let o = (parts[0] === 'cfg') ? cfg : (parts[0] === 'learn') ? cfg.learn : (parts[0] === 'steer') ? cfg.steer : (parts[0] === 'score') ? null : (parts[0] === 'brain') ? cfg.brain : null;
+    // score 特殊：cfg 沒有 score，用 cfg.learn.params 或 cfg.steer
+    if (parts[0] === 'score') {
+      if (parts[1] === 'passiveFirst') return cfg.passiveFirst;
+      if (parts[1] === 'xpWeight') return cfg.steer.xpWeight;
+      if (parts[1] === 'atkWeight') return cfg.steer.atkWeight;
+      if (parts[1] === 'cdWeight') return cfg.steer.cdWeight;
+    }
+    if (!o) return undefined;
+    return parts.slice(1).reduce((a, k) => (a == null ? undefined : a[k]), o);
+  }
+  function brainSet(id, v) {
+    const parts = id.split('.');
+    if (parts[0] === 'score') {
+      if (parts[1] === 'passiveFirst') { cfg.passiveFirst = v; return; }
+      if (parts[1] === 'xpWeight') { cfg.steer.xpWeight = v; return; }
+      if (parts[1] === 'atkWeight') { cfg.steer.atkWeight = v; return; }
+      if (parts[1] === 'cdWeight') { cfg.steer.cdWeight = v; return; }
+      return;
+    }
+    let o = (parts[0] === 'cfg') ? cfg : (parts[0] === 'learn') ? cfg.learn : (parts[0] === 'steer') ? cfg.steer : (parts[0] === 'brain') ? cfg.brain : null;
+    if (!o) return;
+    const keys = parts.slice(1);
+    for (let i = 0; i < keys.length - 1; i++) { if (o[keys[i]] == null) o[keys[i]] = {}; o = o[keys[i]]; }
+    o[keys[keys.length - 1]] = v;
+  }
+
+  // 人類值：從 learn 資料推導（若 humanTrackable）
+  function brainHumanValue(reg) {
+    if (!reg.humanTrackable) return null;
+    const src = reg.humanSource;
+    if (!src) return null;
+    const v = brainGet(src.replace(/^learn\./, 'learn.').replace(/^steer\./, 'steer.'));
+    // brainGet 用 id 路徑，humanSource 已是 learn.xxx / steer.xxx 但 id 前綴是 learn./steer.；直接取 cfg.learn/cfg.steer
+    const parts = src.split('.');
+    let o = cfg;
+    for (const k of parts) { if (o == null) return null; o = o[k]; }
+    return (typeof o === 'number' && isFinite(o)) ? o : null;
+  }
+
+  // 建立 / 重建知識圖譜（所有參數 = 節點；依分類 + 因果關係建邊）
+  function buildBrain() {
+    const B = cfg.brain;
+    B.nodes = B.nodes || {};
+    // 節點：每個註冊參數
+    for (const reg of PARAM_REGISTRY) {
+      const cur = brainGet(reg.id);
+      const hum = brainHumanValue(reg);
+      B.nodes[reg.id] = {
+        id: reg.id, label: reg.label, cat: reg.cat, type: reg.type,
+        value: (cur == null ? reg.def : cur),
+        def: reg.def, human: hum,
+        min: reg.min, max: reg.max, step: reg.step,
+        desc: reg.desc || '', humanTrackable: !!reg.humanTrackable,
+        locked: (cfg.learn && cfg.learn.params && cfg.learn.params.locked && cfg.learn.params.locked[reg.id]) || false,
+        updatedAt: Date.now(),
+      };
+    }
+    // 額外節點：學習到的偏好（卡牌/羈絆/道具）與概念節點
+    const L = cfg.learn;
+    for (const bag of ['cards', 'bonds', 'items']) {
+      const V = L.values && L.values[bag] || {};
+      const C = L[bag] || {};
+      const keys = new Set([...Object.keys(V), ...Object.keys(C)]);
+      for (const k of keys) {
+        const id = 'pref:' + bag + ':' + k;
+        const v = V[k]; const c = C[k];
+        const conf = (v && v.n >= 3) ? v.v : (c && c.t >= 3 ? (c.n + 1) / (c.t + 2) : 0.5);
+        B.nodes[id] = { id, label: k, cat: 'preference', type: 'pref', value: conf, def: 0.5, human: null,
+          desc: `${bag} 偏好 (n=${(v && v.n) || (c && c.t) || 0})`, humanTrackable: true, updatedAt: Date.now() };
+      }
+    }
+    // 概念節點
+    for (const c of ['survival', 'damage', 'xp_gain', 'safety', 'efficiency']) {
+      if (!B.nodes['concept:' + c]) B.nodes['concept:' + c] = { id: 'concept:' + c, label: c, cat: 'concept', type: 'concept', value: 0.5, def: 0.5, human: null, desc: '概念節點', updatedAt: Date.now() };
+    }
+    // 邊：同分類內的參數互相影響（全連接，權重 0.3）
+    B.edges = [];
+    const nodeIds = Object.keys(B.nodes);
+    // 分類內邊
+    const byCat = {};
+    for (const n of nodeIds) { const c = B.nodes[n].cat; (byCat[c] = byCat[c] || []).push(n); }
+    for (const c in byCat) {
+      const ns = byCat[c];
+      for (let i = 0; i < ns.length; i++) for (let j = i + 1; j < ns.length; j++) {
+        B.edges.push({ from: ns[i], to: ns[j], rel: 'same_category', w: 0.2, evidence: 0 });
+      }
+    }
+    // 因果邊：恐懼參數 -> 移動安全
+    const causal = [
+      ['steer.fearLow', 'concept:safety'], ['steer.fearMid', 'concept:safety'], ['steer.fearK', 'concept:safety'],
+      ['steer.retreatDist', 'concept:safety'], ['steer.orbHp', 'concept:survival'],
+      ['steer.healCardHp', 'concept:survival'], ['learn.healThr', 'concept:survival'],
+      ['score.xpWeight', 'concept:xp_gain'], ['cfg.farm', 'concept:efficiency'],
+      ['learn.cardStr', 'concept:efficiency'],
+    ];
+    for (const [a, b] of causal) {
+      if (B.nodes[a] && B.nodes[b]) B.edges.push({ from: a, to: b, rel: 'influences', w: 0.6, evidence: 0 });
+    }
+    // 偏好 -> 概念
+    for (const bag of ['cards', 'bonds', 'items']) {
+      const V = L.values && L.values[bag] || {};
+      for (const k of Object.keys(V)) {
+        const id = 'pref:' + bag + ':' + k;
+        if (B.nodes[id]) {
+          const target = bag === 'cards' ? 'concept:xp_gain' : 'concept:efficiency';
+          B.edges.push({ from: id, to: target, rel: 'improves', w: (V[k].v || 0.5) * 0.8, evidence: V[k].n || 0 });
+        }
+      }
+    }
+    B.updatedAt = Date.now();
+    save();
+  }
+
+  // Hebbian + 獎勵調變更新：一局結束後，依品質強化/削弱活躍邊
+  function adaptBrain(q, activeIds) {
+    const B = cfg.brain;
+    if (!B || !B.edges) return;
+    const lr = (cfg.brain.emaLr != null ? cfg.brain.emaLr : (cfg.steer.brainLr || 0.15));
+    const decay = (cfg.brain.decay != null ? cfg.brain.decay : 0.85);
+    const delta = (q - 0.5) * 2;   // -1 ~ +1
+    const activeSet = new Set(activeIds || []);
+    for (const e of B.edges) {
+      if (activeSet.has(e.from) || activeSet.has(e.to)) {
+        e.w = Math.max(0, Math.min(1, e.w + lr * delta * 0.3));
+        e.evidence = (e.evidence || 0) + 1;
+      } else {
+        e.w = e.w * decay + (1 - decay) * 0.3;
+      }
+    }
+    // 節點 value EMA（對 human-trackable 參數，拉向 human 值）
+    for (const reg of PARAM_REGISTRY) {
+      const node = B.nodes[reg.id];
+      if (!node || !reg.humanTrackable) continue;
+      const hum = brainHumanValue(reg);
+      if (hum == null) continue;
+      const cur = node.value;
+      node.value = cur * decay + hum * (1 - decay);
+      node.human = hum;
+    }
+    B.updatedAt = Date.now();
+    save();
+  }
+
+  // 匯出腦（完整圖譜 + 參數 + 學習資料）
+  function exportBrain() {
+    try {
+      buildBrain();
+      const data = { app: 'psbot', kind: 'brain', v: 1, at: new Date().toISOString(),
+        cfg: { on: cfg.on, move: cfg.move, cards: cfg.cards, bonds: cfg.bonds, items: cfg.items, rift: cfg.rift, orbs: cfg.orbs, restart: cfg.restart, noRank: cfg.noRank, farm: cfg.farm, focus: cfg.focus, passiveFirst: cfg.passiveFirst, record: cfg.record, steer: cfg.steer, profiles: cfg.profiles },
+        learn: cfg.learn, brain: cfg.brain };
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+      const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
+      a.download = `psbot-brain-${new Date().toISOString().slice(0, 10)}.json`;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+      learnMsg(`已匯出腦（${Object.keys(cfg.brain.nodes).length} 節點）`);
+    } catch (e) { learnMsg('匯出失敗：' + e.message); }
+  }
+
+  // 匯入腦（合併：節點 union、邊 union、值加權平均、學習資料 merge）
+  function importBrainFile(file) {
+    const rd = new FileReader();
+    rd.onload = () => {
+      try {
+        const d = JSON.parse(String(rd.result));
+        const src = d && d.brain ? d : (d && d.learn ? { brain: null, learn: d.learn, cfg: d.cfg } : null);
+        if (!src) throw new Error('不是 PSBot 腦檔案');
+        if (src.cfg && typeof src.cfg === 'object') {
+          if (src.cfg.steer) Object.assign(cfg.steer, src.cfg.steer);
+          for (const k of ['move','cards','bonds','items','rift','orbs','restart','noRank','farm','focus','passiveFirst']) {
+            if (typeof src.cfg[k] === 'boolean') cfg[k] = src.cfg[k];
+          }
+        }
+        if (src.learn) mergeLearn(src.learn);
+        if (src.brain && src.brain.nodes) {
+          const B = cfg.brain;
+          // 節點：union，值加權平均
+          for (const [id, n] of Object.entries(src.brain.nodes)) {
+            if (!n || typeof n !== 'object') continue;
+            const ex = B.nodes[id];
+            if (!ex) { B.nodes[id] = JSON.parse(JSON.stringify(n)); }
+            else {
+              // 加權平均 value
+              const w1 = ex.evidence || 1, w2 = n.evidence || 1;
+              ex.value = (ex.value * w1 + (n.value || ex.value) * w2) / (w1 + w2);
+              ex.evidence = (ex.evidence || 0) + (n.evidence || 0);
+              if (n.human != null) ex.human = n.human;
+            }
+          }
+          // 邊：union（相同 from-to-rel 合併權重）
+          const key = e => e.from + '|' + e.to + '|' + e.rel;
+          const idx = new Map(B.edges.map((e, i) => [key(e), i]));
+          for (const e of (src.brain.edges || [])) {
+            if (!e || !e.from || !e.to) continue;
+            const i = idx.get(key(e));
+            if (i == null) { B.edges.push(JSON.parse(JSON.stringify(e))); idx.set(key(e), B.edges.length - 1); }
+            else {
+              const ex = B.edges[i];
+              const w1 = ex.evidence || 1, w2 = e.evidence || 1;
+              ex.w = (ex.w * w1 + (e.w || ex.w) * w2) / (w1 + w2);
+              ex.evidence = (ex.evidence || 0) + (e.evidence || 0);
+            }
+          }
+        }
+        buildBrain();
+        save();
+        learnMsg(`已匯入腦：${Object.keys(cfg.brain.nodes).length} 節點`);
+      } catch (e) { learnMsg('匯入失敗：' + e.message); }
+    };
+    rd.onerror = () => learnMsg('讀取檔案失敗');
+    rd.readAsText(file);
+  }
+
+  // Canvas 力導向圖渲染
+  function renderBrainGraph(canvas) {
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const W = canvas.width, H = canvas.height;
+    const B = cfg.brain;
+    buildBrain();
+    const nodes = Object.values(B.nodes);
+    const edges = B.edges || [];
+    // 初始化位置（若沒有）
+    if (!canvas._pos) canvas._pos = {};
+    const pos = canvas._pos;
+    for (const n of nodes) {
+      if (!pos[n.id]) { pos[n.id] = { x: W/2 + (Math.random()-0.5)*W*0.6, y: H/2 + (Math.random()-0.5)*H*0.6, vx:0, vy:0 }; }
+    }
+    // 力導向迭代
+    for (let iter = 0; iter < 40; iter++) {
+      // 斥力
+      for (let i = 0; i < nodes.length; i++) for (let j = i+1; j < nodes.length; j++) {
+        const a = pos[nodes[i].id], b = pos[nodes[j].id];
+        let dx = b.x - a.x, dy = b.y - a.y;
+        const d = Math.max(1, Math.hypot(dx, dy));
+        const f = 800 / (d * d);
+        a.vx -= (dx/d)*f; a.vy -= (dy/d)*f;
+        b.vx += (dx/d)*f; b.vy += (dy/d)*f;
+      }
+      // 引力（邊）
+      for (const e of edges) {
+        const a = pos[e.from], b = pos[e.to];
+        if (!a || !b) continue;
+        let dx = b.x - a.x, dy = b.y - a.y;
+        const d = Math.max(1, Math.hypot(dx, dy));
+        const f = (d - 60) * 0.02 * (e.w || 0.5);
+        a.vx += (dx/d)*f; a.vy += (dy/d)*f;
+        b.vx -= (dx/d)*f; b.vy -= (dy/d)*f;
+      }
+      // 向心力 + 阻尼
+      for (const n of nodes) {
+        const p = pos[n.id];
+        p.vx += (W/2 - p.x) * 0.001;
+        p.vy += (H/2 - p.y) * 0.001;
+        p.vx *= 0.85; p.vy *= 0.85;
+        p.x = Math.max(10, Math.min(W-10, p.x + p.vx));
+        p.y = Math.max(10, Math.min(H-10, p.y + p.vy));
+      }
+    }
+    // 繪製
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = 'rgba(14,18,32,1)'; ctx.fillRect(0, 0, W, H);
+    // 邊
+    for (const e of edges) {
+      const a = pos[e.from], b = pos[e.to];
+      if (!a || !b) continue;
+      ctx.strokeStyle = e.rel === 'influences' ? 'rgba(255,138,216,0.5)' : e.rel === 'improves' ? 'rgba(90,200,120,0.5)' : 'rgba(100,120,180,0.25)';
+      ctx.lineWidth = 0.5 + (e.w || 0.3) * 2;
+      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+    }
+    // 節點
+    const catColor = { core: '#ff8ad8', movement: '#4aa3ff', learning: '#ffd23f', scoring: '#9fb1c9', brain: '#c084fc', preference: '#5ac878', concept: '#ff6b6b' };
+    for (const n of nodes) {
+      const p = pos[n.id];
+      if (!p) continue;
+      const r = n.type === 'concept' ? 8 : n.type === 'pref' ? 5 : 6;
+      ctx.fillStyle = catColor[n.cat] || '#888';
+      ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI*2); ctx.fill();
+      ctx.fillStyle = '#e8ecf6';
+      ctx.font = '9px system-ui';
+      ctx.textAlign = 'center';
+      ctx.fillText((n.label || n.id).slice(0, 12), p.x, p.y - r - 2);
+    }
+    // 圖例
+    ctx.font = '9px system-ui'; ctx.textAlign = 'left';
+    let lx = 8, ly = H - 8;
+    for (const [c, col] of Object.entries(catColor)) {
+      ctx.fillStyle = col; ctx.fillRect(lx, ly - 8, 8, 8);
+      ctx.fillStyle = '#9fb1c9'; ctx.fillText(c, lx + 10, ly);
+      lx += 70;
+      if (lx > W - 60) { lx = 8; ly -= 12; }
+    }
   }
 
   // ---------- 4. 選卡邏輯 ----------
@@ -1142,7 +1515,7 @@
     if (!ns.Rift.inArena && W && W.specialsNear) for (const o of W.specialsNear(p.x, p.y, 700)) {
       // 祭壇（25 秒 buff：傷害×2 / 速度 / 磁吸×4 / 冷卻-40%）、泉水（回血）、大寶箱（站 3.5 秒開箱）
       if (o.type === 'altar' && !o.used) out.push({ key: 'altar' + o.id, tier: 2, x: o.x, y: o.y, value: 5, left: Infinity, mode: '吃 buff', goalTol: 1, chase: true });
-      else if (o.type === 'spring' && hpPct < 0.6 && (o.charge ?? 1) > 0.2) out.push({ key: 'spring' + o.id, tier: 2, x: o.x, y: o.y - 8, value: 7, left: Infinity, mode: '泉水回血', goalTol: 0, hold: 20, until: () => p.hp >= p.maxHp * 0.95 });
+      else if (o.type === 'spring' && hpPct < (((cfg.steer && cfg.steer.springHp) || 0.6)) && (o.charge ?? 1) > 0.2) out.push({ key: 'spring' + o.id, tier: 2, x: o.x, y: o.y - 8, value: 7, left: Infinity, mode: '泉水回血', goalTol: 0, hold: 20, until: () => p.hp >= p.maxHp * 0.95 });
       else if (o.type === 'bigchest' && hpPct > 0.5) {
         // 遊戲的判定：站在離寶箱中心 46px 內滿 3.5 秒。寶箱本身是實心的，旁邊又常有樹，
         // 舊版走向寶箱中心、要求 34px 內才停，被樹擋住就一直蹭樹開不到。
@@ -1300,7 +1673,9 @@
     // 怪越多範圍招越賺（貝殼之鈴照傷害回血，打越多回越多），場上 ≥54 隻時新生的怪是精英（經驗 ×1.6）。
     // 血掉到 45% 以下就退回一般走位，回到 65% 再開
     const aoe = p.activeGroup && p.activeGroup().some(m => FARM_KINDS.includes(m.kind));
-    S.farm = cfg.farm && aoe && !(ns.Rift && ns.Rift.inArena) && !(ns.Judgment && ns.Judgment.active) && (S.farm ? hpPct > 0.45 : hpPct > 0.65);
+    const farmOff = (cfg.steer && cfg.steer.farmHpOff != null) ? cfg.steer.farmHpOff : 0.45;
+    const farmOn = (cfg.steer && cfg.steer.farmHpOn != null) ? cfg.steer.farmHpOn : 0.65;
+    S.farm = cfg.farm && aoe && !(ns.Rift && ns.Rift.inArena) && !(ns.Judgment && ns.Judgment.active) && (S.farm ? hpPct > farmOff : hpPct > farmOn);
     // 養怪時要待在怪群旁邊：小怪的危險度降一點，不然一靠近就切去「躲避」，圈繞不起來。
     // 但不能降太多（v1.8.0 降到 0.08 會直接衝進怪潮邊緣硬扛）；血越少越怕。首領、地面預警照樣躲
     if (S.farm) fear = Math.min(fear, hpPct > 0.8 ? 0.15 : 0.2);
@@ -2072,6 +2447,13 @@
     </div>
   </details>
   <details data-k="histBox"><summary>戰績（最近 5 局）</summary><div class="st" data-k="hist"></div></details>
+  <details data-k="brainBox"><summary>🧠 腦知識圖譜（所有參數）</summary>
+    <canvas data-k="brainCanvas" width="220" height="180" style="width:100%;border:1px solid #3a4466;border-radius:4px;background:#0a0e1a"></canvas>
+    <div class="row"><button data-k="brainExport">匯出腦</button><button data-k="brainImport">匯入腦</button><button data-k="brainRebuild">重建</button></div>
+    <input type="text" data-k="brainSearch" placeholder="搜尋參數..." style="width:100%;padding:2px 4px;background:#1a2040;color:#e8ecf6;border:1px solid #3a4466;border-radius:4px">
+    <div class="st" data-k="brainInfo" style="max-height:260px;overflow:auto"></div>
+    <input type="file" data-k="brainFile" accept=".json,application/json" style="display:none">
+  </details>
   <details data-k="buildBox" open><summary data-k="ptitle">畢業配置</summary>
     <div class="chips" data-k="build"></div>
     <div class="row"><select data-k="pool"></select><button data-k="add">加入</button></div>
@@ -2210,6 +2592,83 @@
     };
     renderDash();
     try { window.__renderDash = renderDash; } catch (e) {}
+
+    // ---------- 腦知識圖譜 UI ----------
+    function renderBrain() {
+      try { buildBrain(); } catch (e) {}
+      const canvas = document.querySelector('#pss [data-k="brainCanvas"]');
+      if (canvas) renderBrainGraph(canvas);
+      const info = document.querySelector('#pss [data-k="brainInfo"]');
+      const q = (document.querySelector('#pss [data-k="brainSearch"]') || {}).value || '';
+      if (!info) return;
+      const B = cfg.brain;
+      const nodes = Object.values(B.nodes || {});
+      const filtered = q ? nodes.filter(n => (n.label + ' ' + n.id + ' ' + (n.desc||'')).toLowerCase().includes(q.toLowerCase())) : nodes;
+      // group by cat
+      const groups = {};
+      for (const n of filtered) { (groups[n.cat] = groups[n.cat] || []).push(n); }
+      const lines = [];
+      lines.push(`節點 ${nodes.length} · 邊 ${ (B.edges||[]).length } · 匯入匯出可分享最優參數`);
+      for (const cat of BRAIN_CATS) {
+        const ns = groups[cat];
+        if (!ns || !ns.length) continue;
+        lines.push(`【${BRAIN_CAT_LABEL[cat] || cat}】`);
+        for (const n of ns.slice(0, 40)) {
+          const diff = (n.human != null && n.value != null) ? (n.human - n.def) : 0;
+          const adapt = (n.human != null && Math.abs(diff) > 0.001) ? ` →人${Number(n.human).toFixed(3)}` : '';
+          const lock = n.locked ? '🔒' : '';
+          lines.push(`${lock}${n.label}: ${fmtNum(n.value, n.type)} (預設 ${fmtNum(n.def, n.type)})${adapt} ${n.humanTrackable ? '🧍' : ''}`);
+        }
+      }
+      // preference nodes
+      const prefNodes = filtered.filter(n => n.cat === 'preference');
+      if (prefNodes.length) {
+        lines.push('【偏好】');
+        for (const n of prefNodes.slice(0, 20)) lines.push(`${n.label}: ${Number(n.value).toFixed(2)} ${n.desc}`);
+      }
+      info.replaceChildren(...lines.map(t => Object.assign(document.createElement('div'), { textContent: t })));
+    }
+    function fmtNum(v, type) {
+      if (type === 'bool') return v ? 'ON' : 'OFF';
+      if (typeof v !== 'number' || !isFinite(v)) return String(v);
+      return (Math.abs(v) < 10 ? v.toFixed(3) : Math.round(v));
+    }
+    const brainExportBtn = document.querySelector('#pss [data-k="brainExport"]');
+    if (brainExportBtn) brainExportBtn.onclick = exportBrain;
+    const brainImportBtn = document.querySelector('#pss [data-k="brainImport"]');
+    const brainFile = document.querySelector('#pss [data-k="brainFile"]');
+    if (brainImportBtn && brainFile) brainImportBtn.onclick = () => brainFile.click();
+    if (brainFile) brainFile.onchange = e => { const f = e.target.files && e.target.files[0]; if (f) importBrainFile(f); e.target.value = ''; };
+    const brainRebuild = document.querySelector('#pss [data-k="brainRebuild"]');
+    if (brainRebuild) brainRebuild.onclick = () => { buildBrain(); save(); renderBrain(); };
+    const brainSearch = document.querySelector('#pss [data-k="brainSearch"]');
+    if (brainSearch) brainSearch.oninput = renderBrain;
+    renderBrain();
+    try { window.__renderBrain = renderBrain; } catch (e) {}
+    // canvas click to toggle lock (simple: click node nearest center locks its param)
+    const canvas = document.querySelector('#pss [data-k="brainCanvas"]');
+    if (canvas) {
+      canvas.addEventListener('click', (e) => {
+        const rect = canvas.getBoundingClientRect();
+        const x = (e.clientX - rect.left) * (canvas.width / rect.width);
+        const y = (e.clientY - rect.top) * (canvas.height / rect.height);
+        const pos = canvas._pos || {};
+        let best = null, bd = 1e9;
+        for (const n of Object.values(cfg.brain.nodes || {})) {
+          const p = pos[n.id]; if (!p) continue;
+          const d = Math.hypot(p.x - x, p.y - y);
+          if (d < bd) { bd = d; best = n; }
+        }
+        if (best && bd < 14 && best.id.startsWith('steer.') || best && bd < 14 && best.id.startsWith('learn.') || best && bd < 14 && best.id.startsWith('cfg.')) {
+          // toggle lock in learn.params.locked (for tracked) — store in node
+          best.locked = !best.locked;
+          if (cfg.learn && cfg.learn.params && cfg.learn.params.locked) cfg.learn.params.locked[best.id] = best.locked;
+          save(); renderBrain();
+        }
+      });
+    }
+    // 定期刷新腦圖
+    setInterval(() => { try { renderBrain(); } catch (e) {} }, 2000);
     // 面板不要把按鍵 / 點擊漏給遊戲
     for (const t of ['pointerdown', 'mousedown', 'click', 'touchstart']) el.addEventListener(t, e => e.stopPropagation());
 
