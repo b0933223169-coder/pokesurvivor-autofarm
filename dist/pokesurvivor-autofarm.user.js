@@ -2,7 +2,7 @@
 // @name         PokéSurvivor 自動掛機 (PSBot)
 // @name:en      PokéSurvivor Auto-Farm (PSBot)
 // @namespace    https://github.com/b0933223169-coder/pokesurvivor-autofarm
-// @version      1.8.15
+// @version      1.8.16
 // @description  PokéSurvivor 自動走位躲招、選卡、綁羈絆、進神祕裂縫、處理事件（Gholdengo、求救、祭壇…）、自動再開一局
 // @description:en Auto movement & dodging, card picks, bonds, rifts, events (Gholdengo, rescues, altars…) and auto restart for PokéSurvivor
 // @author       BoundlessEgret
@@ -20,13 +20,15 @@
 
 /* PokéSurvivor 自動掛機 — 在頁面世界 (MAIN) 於 document_start 執行。
  *
- * 遊戲把所有模組掛在一個內部命名空間物件上（var ns = Object.create(null); ns.BUILT = true; ns.LIFT = 18; ns.Game = ...），
- * 這個物件不會暴露到 window。2026-10-31 起遊戲改用 Object.create(null) 建命名空間，
- * 所以舊版在 Object.prototype 上埋 'Game' setter 的做法已失效，而且會污染所有物件、
- * 觸發遊戲的擴充功能偵測（顯示「A browser extension is not compatible with the game」）。
- * 新做法：載入前用 Proxy 暫時包住 Object.create，記下「沒有原型」的新物件當候選，
- * 等其中一個被填好（BUILT、LIFT、Game 都在）就接上，並且第一時間還原 Object.create。
- * 這招不依賴混淆後的變數名，遊戲改版也比較不容易壞。
+ * 遊戲把所有模組掛在一個內部命名空間物件上（Object.create(null)，再掛上 Game、Input、RunUI…），
+ * 這個物件不會暴露到 window。舊版在 Object.prototype 上埋 'Game' setter 會污染所有物件、
+ * 觸發遊戲的擴充功能偵測（顯示「A browser extension is not compatible with the game」），已移除。
+ * 現在的做法：
+ * 1. 載入前用 Proxy 暫時包住 Object.create，記下「沒有原型」的新物件，遊戲腳本跑完後
+ *    挑出屬性最多、同時有 true（BUILT）和 18（LIFT）的那個，就是命名空間，立刻還原 Object.create。
+ * 2. 新版連模組鍵名也混淆了（ns.Game 變成 ns._1524c2c，每次改版都換），所以不看鍵名，
+ *    改看每個模組自己的方法 / 屬性來認（有 showLevelUp 的就是 RunUI、有 isFree 的就是 World…），
+ *    再在命名空間上補不可列舉的明文別名給 bot 用。遊戲自己的程式碼照樣用混淆鍵名，互不干擾。
  */
 (() => {
   'use strict';
@@ -36,9 +38,8 @@
   if (window[GUARD]) return;
   try { Object.defineProperty(window, GUARD, { value: 1, configurable: true }); } catch { window[GUARD] = 1; }
 
-  const HOOK_KEY = 'Game';
   const STORE_KEY = 'psbot.v1';
-  const VERSION = '1.8.15';   // 改程式時記得跟 manifest.json 一起改，面板標題會顯示，用來確認瀏覽器跑的是不是新版
+  const VERSION = '1.8.16';   // 改程式時記得跟 manifest.json 一起改，面板標題會顯示，用來確認瀏覽器跑的是不是新版
   const log = (...a) => console.log('%c[PSBot]', 'color:#ff8ad8', ...a);
   let capturedNs = null;
 
@@ -61,13 +62,14 @@
   } catch {}
 
   // ---------- 1. 抓命名空間 ----------
-  // 遊戲把所有模組（Game、Input、RunUI…）掛在一個命名空間物件上，不放到 window。
-  // 2026-10-31 起遊戲改用 Object.create(null) 建命名空間。載入前先用 Proxy 包住 Object.create，
-  // 記下「沒有原型」的新物件當候選，等其中一個被填好（BUILT、LIFT、Game 都在）就接上。
+  // 遊戲用 Object.create(null) 建一個命名空間物件，再把所有模組掛上去，不放到 window。
+  // 新版連模組鍵名都混淆了，所以不能再用 BUILT / LIFT / Game 判斷，改成看「屬性最多、
+  // 同時有 true（BUILT）和 18（LIFT）」的 null 物件。app.min.js 是同步執行的，
+  // interval 看到它時一定已經填滿，不會抓到半成品。
   // 注意：
-  // - 不再碰 Object.prototype：null 命名空間掛不到它、而且污染所有物件會觸發遊戲警告。
-  // - 用 Proxy 包原生函數（而不是 JS function）：toString / length / name 都轉發給原生，看起來像原生。
-  // - 只要抓到第一批候選就同步還原：遊戲檔案是同步執行的，包住的時間越短越不易觸發偵測。
+  // - 不碰 Object.prototype：null 命名空間掛不到它，污染所有物件也會觸發遊戲警告。
+  // - 用 Proxy 包原生函數（而不是 JS function）：toString / length / name 都轉發給原生。
+  // - 抓到就立刻還原 Object.create，把包住的時間縮到最短。
   let booted = false;
   const origCreate = Object.create, nullObjs = [];
   let wrappedCreate = null;
@@ -77,31 +79,116 @@
     unhook();
     clearInterval(poll);
     capturedNs = ns;
+    try { resolveNs(ns); } catch (e) { console.warn('[PSBot] resolve', e); }
     try { boot(ns); } catch (e) { console.error('[PSBot] boot failed', e); }
   };
   try {
     wrappedCreate = new Proxy(origCreate, {
       apply(target, thisArg, args) {
         const o = Reflect.apply(target, thisArg, args);
-        if (args[0] === null && !booted && nullObjs.length < 32) {
-          nullObjs.push(o);
-          // 抓到的候選不會再變：同步還原，後續程式碼看到的都是原生 Object.create
-          //（poll 用已記住的參照接 ns，所以還原不影響抓取）
-          if (nullObjs.length >= 16) unhook();
-        }
+        if (args[0] === null && !booted && nullObjs.length < 64) nullObjs.push(o);
         return o;
       },
     });
     Object.create = wrappedCreate;
   } catch { wrappedCreate = null; }
+  const looksLikeNs = o => {
+    if (!o || typeof o !== 'object') return false;
+    const vals = Object.values(o);
+    if (vals.length < 20) return false;
+    let hasTrue = false, hasLift = false;
+    for (const v of vals) { if (v === true) hasTrue = true; else if (v === 18) hasLift = true; }
+    return hasTrue && hasLift;
+  };
   const poll = setInterval(() => {
     if (booted) return clearInterval(poll);
-    const ns = nullObjs.find(o => o.BUILT === true && 'LIFT' in o && o[HOOK_KEY]);
+    const ns = nullObjs.find(looksLikeNs);
     if (ns) start(ns);
-  }, 10);
+  }, 20);
   // 5 秒都沒抓到：還原 Object.create，不要一直留著包裝；抓到的候選還會繼續等一下
   setTimeout(() => { if (!booted) unhook(); }, 5000);
   setTimeout(() => { if (!booted) { clearInterval(poll); unhook(); console.warn('[PSBot] namespace not found — the game may have changed'); } }, 30000);
+
+  // ---------- 1b. 用「形狀」認出混淆後的模組 ----------
+  // 遊戲每個模組的鍵名都會改版換一次，但模組自己的方法不會。這裡逐個比對特徵方法，
+  // 找到後在命名空間上補一個不可列舉的明文別名（ns.Game = ...），bot 就照舊用明文鍵名。
+  // 遊戲自己的程式碼仍然用原本的混淆鍵名，兩邊互不干擾；別名不可列舉，也不會被列舉偵測看到。
+  const isObj = v => v && (typeof v === 'object' || typeof v === 'function');
+  const hasFns = (v, ...ks) => isObj(v) && ks.every(k => typeof v[k] === 'function');
+  const hasKeys = (v, ...ks) => isObj(v) && ks.every(k => k in v);
+  const alias = (ns, name, val) => {
+    if (val === undefined || val === null) return;
+    try { Object.defineProperty(ns, name, { value: val, writable: true, enumerable: false, configurable: true }); } catch {}
+  };
+
+  function resolveNs(ns) {
+    const vals = Object.keys(ns).map(k => ns[k]);
+    const find = test => vals.find(test);
+    // 已經有明文鍵的模組（T、Stats、Items、UI、Gacha、Judgment、Ranking、Sprites、Upgrades…）不動
+    const set = (name, test) => {
+      if (ns[name] !== undefined) return;
+      const v = find(test);
+      if (v !== undefined) alias(ns, name, v);
+    };
+
+    set('Game',        v => hasFns(v, 'startRun', 'togglePause') && hasKeys(v, 'player', 'state', 'st'));
+    set('RunUI',       v => hasFns(v, 'showLevelUp', 'showBond', 'showItemChoice', 'pick', 'pickBond'));
+    set('LevelUp',     v => hasFns(v, 'offer') && hasKeys(v, 'STATS'));
+    set('Input',       v => hasFns(v, 'axis') && !hasFns(v, 'showLevelUp'));
+    set('EnemyMgr',    v => hasFns(v, 'all', 'bossAlive', 'queryCircle'));
+    set('Pickups',     v => hasFns(v, 'all', 'dropXp', 'pullAll'));
+    set('Projectiles', v => hasFns(v, 'all', 'spawn', 'spawnOrb'));
+    set('Hazards',     v => hasFns(v, 'add', 'clear', 'inside') && !hasKeys(v, 'BY', 'SLOTS'));
+    set('Orbs',        v => hasFns(v, 'use', 'useSelected') && hasKeys(v, 'BY', 'SLOTS'));
+    set('Rift',        v => hasKeys(v, 'inArena', 'rift', 'arena') && hasFns(v, 'update'));
+    set('Progress',    v => hasFns(v, 'checkAch', 'claim') && hasKeys(v, 'titles'));
+    set('World',       v => hasFns(v, 'isFree', 'projectileBlock', 'specialsNear'));
+    set('Types',       v => hasFns(v, 'mult') && hasKeys(v, 'CHART'));
+    set('Weather',     v => hasFns(v, 'mult', 'speedFor') && hasKeys(v, 'KINDS'));
+    set('Events',      v => hasFns(v, '_dbg') && hasKeys(v, 'golden'));
+    set('Flow',        v => hasFns(v, 'goMenu', 'afterLogin'));
+    set('Tiles',       v => hasKeys(v, 'T', 'BIOMES') && hasFns(v, 'runBiome'));
+    set('DB',          v => hasFns(v, 'commit', 'upgradesOf') && hasKeys(v, 'save'));
+    set('Moves',       v => hasFns(v, 'poolFor') && hasKeys(v, 'BY_ID', 'EVO'));
+    set('DEX',         v => Array.isArray(v) && v.length > 100 && v[0] && typeof v[0].dex === 'number' && 'bst' in v[0]);
+    set('DEX_BY',      v => !Array.isArray(v) && isObj(v) && v[1] && v[1].dex === 1 && v[25] && v[25].dex === 25 && 'name' in v[25]);
+
+    // 能力表：新版是「特性 → 圖鑑編號」的大表，bot 要的是反過來「圖鑑編號 → 特性」。
+    // 特徵：鍵是 kebab-case 的特性名，值是圖鑑編號陣列。
+    if (ns.DEX_ABIL === undefined) {
+      const raw = find(v => isObj(v) && typeof v === 'object' && !Array.isArray(v)
+        && Object.keys(v).length > 50
+        && Object.keys(v).some(k => k.includes('-'))
+        && Object.values(v).every(a => Array.isArray(a) && a.every(n => typeof n === 'number')));
+      if (raw) {
+        const inv = {};
+        for (const [ab, dexes] of Object.entries(raw)) for (const d of dexes) (inv[d] = inv[d] || []).push(ab);
+        alias(ns, 'DEX_ABIL', inv);
+      }
+    }
+
+    // LIFT：命名空間裡唯一的數字 18（子彈 / 障礙物判定用的高度差）
+    if (ns.LIFT === undefined) {
+      const n = vals.find(v => typeof v === 'number' && v === 18);
+      if (n !== undefined) alias(ns, 'LIFT', n);
+    }
+
+    // 開局招式：遊戲自己的 startChoices / baseStartOf 也是用 Moves + DEX_BY 算的，
+    // 直接照同樣的規則補上，省得再猜哪個匿名函數是哪個。
+    if (ns.Moves && ns.DEX_BY && ns.Moves.startFor) {
+      const base = dex => { const mon = ns.DEX_BY[dex]; return mon ? ns.Moves.startFor(mon) : null; };
+      if (ns.baseStartOf === undefined) alias(ns, 'baseStartOf', base);
+      if (ns.startChoices === undefined) alias(ns, 'startChoices', dex => {
+        const mon = ns.DEX_BY[dex];
+        if (!mon) return [];
+        const pool = ns.Moves.poolFor(mon).filter(id => ns.Moves.BY_ID[id] && ns.Moves.BY_ID[id].kind !== 'buff');
+        const s = base(dex);
+        if (s && !pool.includes(s)) pool.push(s);
+        return pool;
+      });
+    }
+    return ns;
+  }
 
   // ---------- 2. 設定 ----------
   const DEFAULTS = {
@@ -149,13 +236,20 @@
     // 除錯用：放在 Symbol 下，不可列舉，避免 window 上的明字鍵名觸發偵測
     try { Object.defineProperty(window, Symbol.for('psbot.debug'), { value: { ns, cfg, stats }, configurable: true }); } catch {}
     log('namespace captured, version', VERSION);
-    // 其他模組在 ns.Game 之後才全部就緒，等一個 tick 再 patch
+    // 核心模組都認出來、DOM 也好了才 patch。其他模組晚一點就緒沒關係（用到的地方都有防護）。
+    const need = ['Game', 'Input', 'RunUI', 'LevelUp', 'Moves', 'DEX_BY', 'UI', 'T'];
+    let waited = 0;
     const wait = setInterval(() => {
-      if (ns.Input && ns.RunUI && ns.LevelUp && ns.Moves && ns.Game && document.body) {
+      const missing = need.filter(k => ns[k] === undefined || ns[k] === null);
+      if (!missing.length && document.body) {
         clearInterval(wait);
         patch(ns);
         buildPanel(ns);
+        return;
       }
+      // 形狀辨識沒認出核心模組：再試一次（有些模組可能晚一點才填好），5 秒後把缺的清單印出來
+      if ((waited += 50) % 500 === 0) try { resolveNs(ns); } catch {}
+      if (waited === 5000) console.warn('[PSBot] still waiting for modules:', missing.join(', ') || '(document.body)');
     }, 50);
   }
 
