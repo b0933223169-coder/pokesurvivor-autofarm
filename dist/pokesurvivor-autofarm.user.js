@@ -2,7 +2,7 @@
 // @name         PokéSurvivor 自動掛機 (PSBot)
 // @name:en      PokéSurvivor Auto-Farm (PSBot)
 // @namespace    https://github.com/b0933223169-coder/pokesurvivor-autofarm
-// @version      1.9.0
+// @version      2.0.0
 // @description  PokéSurvivor 自動走位躲招、選卡、綁羈絆、進神祕裂縫、處理事件（Gholdengo、求救、祭壇…）、自動再開一局
 // @description:en Auto movement & dodging, card picks, bonds, rifts, events (Gholdengo, rescues, altars…) and auto restart for PokéSurvivor
 // @author       BoundlessEgret
@@ -39,7 +39,7 @@
   try { Object.defineProperty(window, GUARD, { value: 1, configurable: true }); } catch { window[GUARD] = 1; }
 
   const STORE_KEY = 'psbot.v1';
-  const VERSION = '1.9.0';   // 改程式時記得跟 manifest.json 一起改，面板標題會顯示，用來確認瀏覽器跑的是不是新版
+  const VERSION = '2.0.0';   // v2：outcome-aware 學習（依局品質加權）+ 參數面板 + 儀表板
   const log = (...a) => console.log('%c[PSBot]', 'color:#ff8ad8', ...a);
   let capturedNs = null;
 
@@ -216,7 +216,7 @@
     // 停止記錄後，下一局開始自動判斷就會參考這些偏好（參數會一直累積，可匯出 / 匯入）
     record: false,
     learn: {
-      v: 1,
+      v: 2,             // v2：加入 outcome-aware 學習（依局數品質加權）
       runs: 0,          // 總共記錄了幾局
       picks: 0,         // 總共記錄了幾次選擇（卡 / 羈絆 / 道具）
       cards: {},        // 卡牌 key（type:id）→ { n: 被選次數, t: 出現次數 }
@@ -224,6 +224,13 @@
       items: {},        // 道具 id → { n, t }
       move: { n: 0, hp: 0, dist: 0, min: null },   // 走位樣本：樣本數、血量總和、最近怪距離總和、單局最低血量
       heal: { n: 0, hp: 0 },                       // 你選「補血」卡當下的血量（用來推 bot 的補血門檻）
+      // outcome-aware：每張卡/羈絆/道具的「價值」EMA（依該局品質加權），取代純計數偏好
+      values: { cards: {}, bonds: {}, items: {} },
+      // outcome-aware：走位參數的 EMA（由成功局推導），可手動鎖定
+      params: { fearLow: null, fearMid: null, fearK: null, healThr: null,
+                cardStr: null, bondStr: null, itemStr: null, locked: {} },
+      // 局歷史（最近 30 局）：用來算品質趨勢與除錯
+      history: [],
       last: null,       // 最後一局 { at, time, level, kills }
       updatedAt: 0,
     },
@@ -244,6 +251,11 @@
   for (const k of ['cards', 'bonds', 'items']) cfg.learn[k] = Object.assign({}, cfg.learn[k] || {});
   cfg.learn.move = Object.assign({}, DEFAULTS.learn.move, cfg.learn.move || {});
   cfg.learn.heal = Object.assign({}, DEFAULTS.learn.heal, cfg.learn.heal || {});
+  cfg.learn.values = Object.assign({ cards: {}, bonds: {}, items: {} }, cfg.learn.values || {});
+  for (const k of ['cards', 'bonds', 'items']) cfg.learn.values[k] = Object.assign({}, cfg.learn.values[k] || {});
+  cfg.learn.params = Object.assign({}, DEFAULTS.learn.params, cfg.learn.params || {});
+  cfg.learn.params.locked = Object.assign({}, cfg.learn.params.locked || {});
+  if (!Array.isArray(cfg.learn.history)) cfg.learn.history = [];
   // 舊版內建的妙蛙種子 / 蓋歐卡配置不符合「開局招式 → 變硬 → 劍舞 / 詭計 → 範圍攻擊」，存檔裡還是原樣的就刪掉，改走自動模式
   for (const [dex, old] of Object.entries({ 1: 'energy-ball,nasty-plot,leaf-storm,giga-drain', 382: 'bubble,nasty-plot,aqua-ring,hydro-pump' }))
     if (cfg.profiles[dex] && (cfg.profiles[dex].moves || []).join() === old) delete cfg.profiles[dex];
@@ -275,7 +287,7 @@
     }, 50);
   }
 
-  const S = { pickTimer: null, lastPos: null, stuckT: 0, unstickT: 0, unstickDir: null, wanderA: Math.random() * 6.28, lastSlotCheck: 0, lastOrb: 0, lastT: performance.now(), overAt: -1e9, againAt: -1e9, lobbyAt: -1e9, coopFull: true, fullLogAt: -1e9, lastPlay: -1e9, pausedAt: 0, userPausedAt: -1e9, lastDir: null, lastOffer: null, orbGoal: null, plan: null, seen: {}, ban: {}, noGo: {}, jCenter: null, holding: false, holdKey: null, holdSince: 0, wd: null, losBadT: 0, spin: 1, spinBlockT: 0, loopC: null, dirIdx: -1, holdT: 0, out: [1, 0], rec: { cards: null, runActive: false, runMin: 1, saveAt: 0 }, recMsg: '', recMsgAt: 0 };
+  const S = { pickTimer: null, lastPos: null, stuckT: 0, unstickT: 0, unstickDir: null, wanderA: Math.random() * 6.28, lastSlotCheck: 0, lastOrb: 0, lastT: performance.now(), overAt: -1e9, againAt: -1e9, lobbyAt: -1e9, coopFull: true, fullLogAt: -1e9, lastPlay: -1e9, pausedAt: 0, userPausedAt: -1e9, lastDir: null, lastOffer: null, orbGoal: null, plan: null, seen: {}, ban: {}, noGo: {}, jCenter: null, holding: false, holdKey: null, holdSince: 0, wd: null, losBadT: 0, spin: 1, spinBlockT: 0, loopC: null, dirIdx: -1, holdT: 0, out: [1, 0], rec: { cards: null, runActive: false, runMin: 1, saveAt: 0, player: null, runCards: [], runBonds: [], runItems: [], runHpSum: 0, runHpN: 0, runDistSum: 0, runDistN: 0, runStartedAt: 0 }, recMsg: '', recMsgAt: 0 };
 
   function patch(ns) {
     // --- 走位：接管 Input.axis()，玩家自己按方向鍵時讓玩家優先 ---
@@ -434,6 +446,9 @@
       const H = cfg.learn.heal;
       H.n++; H.hp += Math.max(0, Math.min(1, hp));
     }
+    // 追蹤本局選了哪些（供 outcome-aware 學習）
+    const arr = bag === 'cards' ? S.rec.runCards : bag === 'bonds' ? S.rec.runBonds : S.rec.runItems;
+    if (arr && !arr.includes(key)) arr.push(key);
     cfg.learn.picks++;
     cfg.learn.updatedAt = Date.now();
   }
@@ -444,18 +459,45 @@
     if (!e || (e.t | 0) < 3) return 0;
     return (e.n + 1) / (e.t + 2) - 0.5;
   }
-  function cardBias(key) { return prefOf('cards', key) * 400; }   // 分數 ±200
-  function bondBias(id) { return prefOf('bonds', id) * 6; }       // 名次 ±3
-  function itemBias(id) { return prefOf('items', id) * 6; }       // 名次 ±3
+  // outcome-aware 偏好：若有足夠的品質加權樣本，用 value EMA；否則退回計數偏好
+  function valPref(bag, key) {
+    const e = cfg.learn.values && cfg.learn.values[bag] && cfg.learn.values[bag][key];
+    if (!e || (e.n | 0) < 3) return null;
+    return e.v - 0.5;   // -0.5 ~ +0.5
+  }
+  function cardBias(key) {
+    const vp = valPref('cards', key);
+    const base = vp != null ? vp : prefOf('cards', key);
+    const str = (cfg.learn.params && cfg.learn.params.cardStr != null) ? cfg.learn.params.cardStr : 400;
+    return base * str;
+  }
+  function bondBias(id) {
+    const vp = valPref('bonds', id);
+    const base = vp != null ? vp : prefOf('bonds', id);
+    const str = (cfg.learn.params && cfg.learn.params.bondStr != null) ? cfg.learn.params.bondStr : 6;
+    return base * str;
+  }
+  function itemBias(id) {
+    const vp = valPref('items', id);
+    const base = vp != null ? vp : prefOf('items', id);
+    const str = (cfg.learn.params && cfg.learn.params.itemStr != null) ? cfg.learn.params.itemStr : 6;
+    return base * str;
+  }
 
   // 每 200ms 取樣一次人類的走位（升級 / 選卡畫面遊戲會暫停，那段不算，但不會中斷這一局的統計）
   function sampleHuman(ns) {
     const p = ns.Game.player;
     if (!p) return;
-    // 換局（新的 player 物件）就重新計算單局最低血量
-    if (S.rec.player !== p) { S.rec.player = p; S.rec.runMin = 1; }
+    // 換局（新的 player 物件）就重新計算單局最低血量與本局統計
+    if (S.rec.player !== p) {
+      S.rec.player = p; S.rec.runMin = 1;
+      S.rec.runCards = []; S.rec.runBonds = []; S.rec.runItems = [];
+      S.rec.runHpSum = 0; S.rec.runHpN = 0; S.rec.runDistSum = 0; S.rec.runDistN = 0;
+    }
     const hp = Math.max(0, Math.min(1, p.hp / p.maxHp));
     if (hp < S.rec.runMin) S.rec.runMin = hp;
+    // 本局統計
+    S.rec.runHpSum += hp; S.rec.runHpN++;
     if (p.dead || ns.Game.state !== 'playing') return;
     let d = 400;   // 最近的怪（小偷不會打人，不算）
     for (const e of ns.EnemyMgr.all()) {
@@ -465,24 +507,68 @@
     }
     const M = cfg.learn.move;
     M.n++; M.hp += hp; M.dist += d;
+    S.rec.runDistSum += d; S.rec.runDistN++;
     cfg.learn.updatedAt = Date.now();
     // 每 5 秒存一次，瀏覽器當掉也只掉幾秒的樣本
     const t = performance.now();
     if (t - (S.rec.saveAt || 0) > 5000) { S.rec.saveAt = t; save(); }
   }
+  // 局品質：存活時間（秒）為主，加上等級/擊倒加權；正規化到 0~1（以 300 秒為滿分）
+  function runQuality(d) {
+    const t = Math.max(0, Math.min(300, d.time || 0));
+    const lvl = Math.max(0, d.level || 0);
+    const kills = Math.max(0, d.kills || 0);
+    const raw = t + lvl * 3 + Math.min(kills, 200) * 0.3;
+    return Math.max(0.05, Math.min(1, raw / 330));
+  }
   function finishLearnRun(d) {
     const L = cfg.learn;
+    const q = runQuality(d);
+    // 本局平均走位
+    const avgHp = S.rec.runHpN > 0 ? S.rec.runHpSum / S.rec.runHpN : null;
+    const avgDist = S.rec.runDistN > 0 ? S.rec.runDistSum / S.rec.runDistN : null;
     L.runs++;
     if (S.rec.runMin != null) {
       const M = L.move;
       M.min = M.min == null ? S.rec.runMin : M.min * 0.7 + S.rec.runMin * 0.3;
     }
+    // outcome-aware：更新 values（EMA，以局品質為權重）
+    const lr = 0.15;   // 學習率
+    const updateVal = (bag, key) => {
+      const V = L.values[bag] || (L.values[bag] = {});
+      const e = V[key] || (V[key] = { v: 0.5, n: 0 });
+      // 沒品質資訊就不動；品質高就拉向 1，品質低就拉向 0
+      e.v += lr * (q - e.v);
+      e.n++;
+    };
+    for (const k of S.rec.runCards) updateVal('cards', k);
+    for (const k of S.rec.runBonds) updateVal('bonds', k);
+    for (const k of S.rec.runItems) updateVal('items', k);
+    // outcome-aware：走位參數 EMA（品質加權：品質高才更新，避免學壞習慣）
+    if (avgHp != null && q > 0.3) {
+      const P = L.params;
+      if (!(P.locked && P.locked.fearLow)) P.fearLow = P.fearLow == null ? Math.max(0.2, Math.min(0.5, avgHp * 0.55)) : P.fearLow * 0.85 + Math.max(0.2, Math.min(0.5, avgHp * 0.55)) * 0.15;
+      if (!(P.locked && P.locked.fearMid)) P.fearMid = P.fearMid == null ? Math.max(0.45, Math.min(0.75, avgHp * 0.9)) : P.fearMid * 0.85 + Math.max(0.45, Math.min(0.75, avgHp * 0.9)) * 0.15;
+      if (!(P.locked && P.locked.fearK)) P.fearK = P.fearK == null ? Math.max(0.7, Math.min(1.4, 0.9 + ((avgDist || 140) - 140) / 400)) : P.fearK * 0.85 + Math.max(0.7, Math.min(1.4, 0.9 + ((avgDist || 140) - 140) / 400)) * 0.15;
+    }
+    if (S.rec.runMin != null && q > 0.3) {
+      const P = L.params;
+      const target = Math.max(0.25, Math.min(0.6, (S.rec.runMin || 0.35) * 1.1));
+      if (!(P.locked && P.locked.healThr)) P.healThr = P.healThr == null ? target : P.healThr * 0.85 + target * 0.15;
+    }
+    // 局歷史
+    if (!Array.isArray(L.history)) L.history = [];
+    L.history.push({ at: Date.now(), time: d.time || 0, level: d.level || 0, kills: d.kills || 0, q,
+      minHp: S.rec.runMin, avgHp, avgDist, cards: S.rec.runCards.slice(), bonds: S.rec.runBonds.slice(), items: S.rec.runItems.slice() });
+    if (L.history.length > 30) L.history = L.history.slice(-30);
     S.rec.player = null;
     S.rec.runActive = false;
+    S.rec.runCards = []; S.rec.runBonds = []; S.rec.runItems = [];
+    S.rec.runHpSum = 0; S.rec.runHpN = 0; S.rec.runDistSum = 0; S.rec.runDistN = 0;
     L.last = { at: Date.now(), time: d.time || 0, level: d.level || 0, kills: d.kills || 0 };
     L.updatedAt = Date.now();
     save();
-    log(`record: run ${L.runs} · min HP ${Math.round((S.rec.runMin || 0) * 100)}%`);
+    log(`record: run ${L.runs} · min HP ${Math.round((S.rec.runMin || 0) * 100)}% · quality ${Math.round(q * 100)}`);
   }
   // 人類的平均走位（樣本夠才回傳；200 筆 = 約 40 秒）
   function learnedMove() {
@@ -490,8 +576,11 @@
     if (!M || (M.n | 0) < 200) return null;
     return { hp: M.hp / M.n, dist: Math.min(400, M.dist / M.n), min: M.min };
   }
-  // 補血卡門檻：優先看你選補血卡時的血量；沒有樣本就用你平常的血量打六折
+  // 補血卡門檻：優先用 outcome-aware 參數；其次看你選補血卡時的血量；再來是你平常的血量
   function healThreshold() {
+    const P = cfg.learn.params;
+    if (P && typeof P.healThr === 'number' && isFinite(P.healThr) && !(P.locked && P.locked.healThr)) return P.healThr;
+    if (P && typeof P.healThr === 'number' && isFinite(P.healThr)) return P.healThr;
     const H = cfg.learn.heal;
     if (H && (H.n | 0) >= 2) return Math.max(0.25, Math.min(0.6, H.hp / H.n + 0.05));
     const lm = learnedMove();
@@ -499,18 +588,31 @@
   }
   // 恐懼模型：人類平均血量高 / 站得遠 = 保守，門檻上移、恐懼放大；反過來就放寬
   function fearModel() {
+    const P = cfg.learn.params;
+    const useP = P && (P.fearLow != null || P.fearMid != null || P.fearK != null);
     const lm = learnedMove();
-    if (!lm) return { low: 0.35, mid: 0.6, k: 1 };
-    const shift = Math.max(-0.12, Math.min(0.12, (lm.hp - 0.65) * 0.4));
-    const k = Math.max(0.7, Math.min(1.4, 0.9 + (lm.dist - 140) / 400 + (lm.hp - 0.65) * 0.8));
-    return { low: 0.35 + shift, mid: 0.6 + shift, k };
+    if (!lm && !useP) return { low: 0.35, mid: 0.6, k: 1 };
+    let low = 0.35, mid = 0.6, k = 1;
+    if (lm) {
+      const shift = Math.max(-0.12, Math.min(0.12, (lm.hp - 0.65) * 0.4));
+      low = 0.35 + shift; mid = 0.6 + shift;
+      k = Math.max(0.7, Math.min(1.4, 0.9 + (lm.dist - 140) / 400 + (lm.hp - 0.65) * 0.8));
+    }
+    // outcome-aware 參數覆寫（若已學到且未鎖定）
+    if (P) {
+      if (typeof P.fearLow === 'number' && isFinite(P.fearLow) && !(P.locked && P.locked.fearLow)) low = P.fearLow;
+      else if (typeof P.fearLow === 'number' && isFinite(P.fearLow)) low = P.fearLow;
+      if (typeof P.fearMid === 'number' && isFinite(P.fearMid)) mid = P.fearMid;
+      if (typeof P.fearK === 'number' && isFinite(P.fearK)) k = P.fearK;
+    }
+    return { low, mid, k };
   }
 
   function learnMsg(t) { S.recMsg = t; S.recMsgAt = performance.now(); log(t); }
   // 匯出：下載一份 JSON，可以給別人匯入
   function exportLearn() {
     try {
-      const data = { app: 'psbot', kind: 'learn', v: 1, at: new Date().toISOString(), learn: cfg.learn };
+      const data = { app: 'psbot', kind: 'learn', v: 2, at: new Date().toISOString(), learn: cfg.learn };
       const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
       const a = document.createElement('a');
       a.href = URL.createObjectURL(blob);
@@ -547,6 +649,35 @@
     const h = src.heal;
     if (h && typeof h === 'object' && num(h.n) > 0) {
       L.heal.n += num(h.n); L.heal.hp += num(h.hp);
+    }
+    // outcome-aware values: merge EMA (weighted by sample counts)
+    const V = src.values;
+    if (V && typeof V === 'object') {
+      for (const bag of LEARN_BAGS) {
+        const dv = L.values[bag] || (L.values[bag] = {});
+        for (const [k, v] of Object.entries(V[bag] || {})) {
+          if (!v || typeof v !== 'object') continue;
+          const e = dv[k] || (dv[k] = { v: 0, n: 0 });
+          const nv = num(v.n);
+          // weighted average of value estimates
+          const total = (e.n | 0) + nv;
+          if (total > 0) e.v = (e.v * (e.n | 0) + (v.v || 0) * nv) / total;
+          e.n = total;
+        }
+      }
+    }
+    // params: keep local unless local is null (import fills gaps); locked wins
+    const P = src.params;
+    if (P && typeof P === 'object') {
+      for (const key of ['fearLow', 'fearMid', 'fearK', 'healThr', 'cardStr', 'bondStr', 'itemStr']) {
+        if (L.params.locked && L.params.locked[key]) continue;
+        if (L.params[key] == null && typeof P[key] === 'number' && isFinite(P[key])) L.params[key] = P[key];
+      }
+      if (P.locked && typeof P.locked === 'object') Object.assign(L.params.locked, P.locked);
+    }
+    // history: concat, keep last 30
+    if (Array.isArray(src.history)) {
+      L.history = (L.history || []).concat(src.history).slice(-30);
     }
     if (src.last && typeof src.last === 'object') {
       const n = v => (typeof v === 'number' && isFinite(v) ? v : 0);
@@ -1945,6 +2076,21 @@
     <div class="st" data-k="recInfo"></div>
     <input type="file" data-k="recFile" accept=".json,application/json" style="display:none">
   </details>
+  <details data-k="dashBox"><summary>學習儀表板（偏好 / 參數 / 品質趨勢）</summary>
+    <div class="st" data-k="dashInfo"></div>
+    <div class="row" style="flex-wrap:wrap;gap:6px">
+      <label style="font-size:10px">fearLow <input type="range" min="0.15" max="0.6" step="0.01" data-p="fearLow" style="width:90px"><span data-v="fearLow"></span></label>
+      <label style="font-size:10px">fearMid <input type="range" min="0.4" max="0.8" step="0.01" data-p="fearMid" style="width:90px"><span data-v="fearMid"></span></label>
+      <label style="font-size:10px">fearK <input type="range" min="0.5" max="1.8" step="0.01" data-p="fearK" style="width:90px"><span data-v="fearK"></span></label>
+      <label style="font-size:10px">healThr <input type="range" min="0.2" max="0.7" step="0.01" data-p="healThr" style="width:90px"><span data-v="healThr"></span></label>
+    </div>
+    <div class="row" style="flex-wrap:wrap;gap:6px">
+      <label style="font-size:10px">cardStr <input type="range" min="0" max="800" step="10" data-p="cardStr" style="width:90px"><span data-v="cardStr"></span></label>
+      <label style="font-size:10px">bondStr <input type="range" min="0" max="12" step="0.5" data-p="bondStr" style="width:90px"><span data-v="bondStr"></span></label>
+      <label style="font-size:10px">itemStr <input type="range" min="0" max="12" step="0.5" data-p="itemStr" style="width:90px"><span data-v="itemStr"></span></label>
+      <button data-k="lockToggle">🔒 鎖定學習</button>
+    </div>
+  </details>
   <details data-k="histBox"><summary>戰績（最近 5 局）</summary><div class="st" data-k="hist"></div></details>
   <details data-k="buildBox" open><summary data-k="ptitle">畢業配置</summary>
     <div class="chips" data-k="build"></div>
@@ -1990,6 +2136,100 @@
     $('recFile').onchange = e => { const f = e.target.files && e.target.files[0]; if (f) importLearnFile(f); e.target.value = ''; };
     $('recClear').onclick = () => { if (confirm('清除所有已學習的參數？（已匯出的檔案不受影響）')) resetLearn(); };
     renderRec();
+    // ---------- 學習儀表板 ----------
+    function fmt(v, d) { return (v == null || !isFinite(v)) ? '—' : Number(v).toFixed(d == null ? 2 : d); }
+    function topEntries(bag, n) {
+      const V = cfg.learn.values && cfg.learn.values[bag] || {};
+      const C = cfg.learn[bag] || {};
+      const keys = new Set([...Object.keys(V), ...Object.keys(C)]);
+      return [...keys].map(k => {
+        const v = V[k] || { v: 0.5, n: 0 };
+        const c = C[k] || { n: 0, t: 0 };
+        const pref = (v.n >= 3) ? (v.v - 0.5) : ((c.t >= 3) ? (c.n + 1) / (c.t + 2) - 0.5 : 0);
+        return { key: k, pref, n: v.n || c.t, t: c.t };
+      }).sort((a, b) => Math.abs(b.pref) - Math.abs(a.pref)).slice(0, n);
+    }
+    function renderDash() {
+      const L = cfg.learn, P = L.params || {};
+      const lines = [];
+      // 參數
+      lines.push(`fearLow=${fmt(P.fearLow,2)} fearMid=${fmt(P.fearMid,2)} fearK=${fmt(P.fearK,2)} healThr=${fmt(healThreshold(),2)}`);
+      lines.push(`strengths: card=${fmt(P.cardStr != null ? P.cardStr : 400,0)} bond=${fmt(P.bondStr != null ? P.bondStr : 6,1)} item=${fmt(P.itemStr != null ? P.itemStr : 6,1)}  locked=${Object.keys(P.locked||{}).filter(k=>P.locked[k]).length}`);
+      // 品質趨勢
+      const hist = (L.history || []).slice(-12);
+      if (hist.length) {
+        const qs = hist.map(h => Math.round((h.q || 0) * 100));
+        lines.push('品質趨勢: ' + qs.map(q => q >= 70 ? '█' : q >= 40 ? '▄' : '▁').join('') + ` (${qs[qs.length-1]}%)`);
+        const last = hist[hist.length-1];
+        lines.push(`上局: ${Math.round(last.time)}s Lv${last.level} 擊倒${last.kills} minHP${Math.round((last.minHp||0)*100)}%`);
+      } else {
+        lines.push('品質趨勢: 尚無局數');
+      }
+      // 偏好 top
+      const sec = (title, bag) => {
+        const es = topEntries(bag, 5).filter(e => Math.abs(e.pref) > 0.01);
+        if (!es.length) return;
+        lines.push(title);
+        for (const e of es) {
+          const bar = e.pref > 0 ? '█'.repeat(Math.round(e.pref * 8)) : '░'.repeat(Math.round(-e.pref * 8));
+          lines.push(`  ${e.key} ${e.pref > 0 ? '+' : ''}${e.pref.toFixed(2)} ${bar} (n=${e.n})`);
+        }
+      };
+      sec('卡牌偏好:', 'cards');
+      sec('羈絆偏好:', 'bonds');
+      sec('道具偏好:', 'items');
+      // 同步 slider 顯示值
+      for (const p of ['fearLow','fearMid','fearK','healThr']) {
+        const el = document.querySelector('#pss [data-p="' + p + '"]');
+        if (el) {
+          const v = (P[p] != null) ? P[p] : (p === 'fearLow' ? 0.35 : p === 'fearMid' ? 0.6 : p === 'fearK' ? 1 : healThreshold());
+          el.value = v;
+          const sp = document.querySelector('#pss [data-v="' + p + '"]');
+          if (sp) sp.textContent = Number(v).toFixed(2);
+        }
+      }
+      for (const p of ['cardStr','bondStr','itemStr']) {
+        const el = document.querySelector('#pss [data-p="' + p + '"]');
+        if (el) {
+          const def = p === 'cardStr' ? 400 : 6;
+          const v = (P[p] != null) ? P[p] : def;
+          el.value = v;
+          const sp = document.querySelector('#pss [data-v="' + p + '"]');
+          if (sp) sp.textContent = (p === 'cardStr') ? Math.round(v) : Number(v).toFixed(1);
+        }
+      }
+      const lb = document.querySelector('#pss [data-k="lockToggle"]');
+      if (lb) lb.textContent = (P.locked && Object.values(P.locked).some(Boolean)) ? '🔓 解鎖學習' : '🔒 鎖定學習';
+      const __di = document.querySelector('#pss [data-k="dashInfo"]');
+      try { window.__dashDi = !!__di; window.__dashLines = lines.slice(); } catch (e) {}
+      if (__di) __di.replaceChildren(...lines.map(t => Object.assign(document.createElement('div'), { textContent: t })));
+      try { window.__dashAfter = __di ? __di.innerText : 'null'; } catch (e) {}
+    }
+    // slider 事件
+    el.querySelectorAll('[data-p]').forEach(sl => {
+      sl.oninput = () => {
+        const key = sl.dataset.p;
+        const v = parseFloat(sl.value);
+        cfg.learn.params = cfg.learn.params || {};
+        cfg.learn.params[key] = v;
+        cfg.learn.params.locked = cfg.learn.params.locked || {};
+        cfg.learn.params.locked[key] = true;
+        const sp = document.querySelector('#pss [data-v="' + key + '"]');
+        if (sp) sp.textContent = (key === 'cardStr') ? Math.round(v) : (key === 'bondStr' || key === 'itemStr') ? Number(v).toFixed(1) : Number(v).toFixed(2);
+        save();
+      };
+    });
+    $('lockToggle').onclick = () => {
+      const P = cfg.learn.params || (cfg.learn.params = {});
+      P.locked = P.locked || {};
+      const anyLocked = Object.values(P.locked).some(Boolean);
+      for (const k of ['fearLow','fearMid','fearK','healThr','cardStr','bondStr','itemStr']) {
+        if (anyLocked) delete P.locked[k]; else P.locked[k] = true;
+      }
+      save(); renderDash();
+    };
+    renderDash();
+    try { window.__renderDash = renderDash; } catch (e) {}
     // 面板不要把按鍵 / 點擊漏給遊戲
     for (const t of ['pointerdown', 'mousedown', 'click', 'touchstart']) el.addEventListener(t, e => e.stopPropagation());
 
@@ -2045,6 +2285,7 @@
 
     setInterval(() => {
       renderRec();
+      try { renderDash(); } catch (e) {}
       renderBuild(false);
       const p = ns.Game.player, inRun = p && ns.Game.state !== 'ui';
       const xpLine = inRun ? `經驗 ×${(p.xpMul || 1).toFixed(2)} · 場上 ${ns.EnemyMgr.count ?? ns.EnemyMgr.all().length}/64${S.spawnLimited ? ' · 怪不夠打（學習優先）' : ''}\n` : '';
