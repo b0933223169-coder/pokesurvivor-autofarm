@@ -19,7 +19,7 @@
   try { Object.defineProperty(window, GUARD, { value: 1, configurable: true }); } catch { window[GUARD] = 1; }
 
   const STORE_KEY = 'psbot.v1';
-  const VERSION = '1.8.16';   // 改程式時記得跟 manifest.json 一起改，面板標題會顯示，用來確認瀏覽器跑的是不是新版
+  const VERSION = '1.8.17';   // 改程式時記得跟 manifest.json 一起改，面板標題會顯示，用來確認瀏覽器跑的是不是新版
   const log = (...a) => console.log('%c[PSBot]', 'color:#ff8ad8', ...a);
   let capturedNs = null;
 
@@ -127,6 +127,8 @@
     set('Weather',     v => hasFns(v, 'mult', 'speedFor') && hasKeys(v, 'KINDS'));
     set('Events',      v => hasFns(v, '_dbg') && hasKeys(v, 'golden'));
     set('Flow',        v => hasFns(v, 'goMenu', 'afterLogin'));
+    // 多人房間（room 是 getter，沒在房間時是 null）
+    set('Room',        v => hasKeys(v, 'room', 'uid', 'friends', 'invites', 'MAX_PLAYERS') && hasFns(v, 'createRoom', 'joinRoom', 'leaveRoom'));
     set('Tiles',       v => hasKeys(v, 'T', 'BIOMES') && hasFns(v, 'runBiome'));
     set('DB',          v => hasFns(v, 'commit', 'upgradesOf') && hasKeys(v, 'save'));
     set('Moves',       v => hasFns(v, 'poolFor') && hasKeys(v, 'BY_ID', 'EVO'));
@@ -233,7 +235,7 @@
     }, 50);
   }
 
-  const S = { pickTimer: null, lastPos: null, stuckT: 0, unstickT: 0, unstickDir: null, wanderA: Math.random() * 6.28, lastSlotCheck: 0, lastOrb: 0, lastT: performance.now(), overAt: -1e9, lastPlay: -1e9, pausedAt: 0, userPausedAt: -1e9, lastDir: null, lastOffer: null, orbGoal: null, plan: null, seen: {}, ban: {}, noGo: {}, jCenter: null, holding: false, holdKey: null, holdSince: 0, wd: null, losBadT: 0, spin: 1, spinBlockT: 0, loopC: null, dirIdx: -1, holdT: 0, out: [1, 0] };
+  const S = { pickTimer: null, lastPos: null, stuckT: 0, unstickT: 0, unstickDir: null, wanderA: Math.random() * 6.28, lastSlotCheck: 0, lastOrb: 0, lastT: performance.now(), overAt: -1e9, againAt: -1e9, lobbyAt: -1e9, lastPlay: -1e9, pausedAt: 0, userPausedAt: -1e9, lastDir: null, lastOffer: null, orbGoal: null, plan: null, seen: {}, ban: {}, noGo: {}, jCenter: null, holding: false, holdKey: null, holdSince: 0, wd: null, losBadT: 0, spin: 1, spinBlockT: 0, loopC: null, dirIdx: -1, holdT: 0, out: [1, 0] };
 
   function patch(ns) {
     // --- 走位：接管 Input.axis()，玩家自己按方向鍵時讓玩家優先 ---
@@ -1525,6 +1527,8 @@
   let lastPartner = 0;
   function autoPartner(ns) {
     if (!cfg.autoPartner || ns.Game.state !== 'ui' || !ns.DB || !ns.DB.save) return;
+    // 在多人房間裡不要換夥伴：換完會呼叫 Flow.goMenu()，把房間畫面蓋掉，房主就開不了下一局
+    if (ns.Room && ns.Room.room) return;
     if (performance.now() - lastPartner < 5000) return;
     lastPartner = performance.now();
     const sv = ns.DB.save, cur = sv.partner;
@@ -1542,7 +1546,7 @@
     ns.Flow && ns.Flow.goMenu && ns.Flow.goMenu();
   }
 
-  // ---------- 8b. 結算後回主選單 → 自動再開一局 ----------
+  // ---------- 8b. 結算後回主選單 / 回房間 → 自動再開一局 ----------
   function autoRestart(ns) {
     if (!cfg.on || !cfg.restart || !['ui', 'over'].includes(ns.Game.state)) return;
     const open = id => { const e = document.getElementById(id); return e && !e.classList.contains('hidden'); };
@@ -1550,8 +1554,25 @@
     for (const [scr, btn] of [['scr-savenote', 'savenote-ok'], ['scr-news', 'news-close'], ['scr-nick', 'nick-later'], ['scr-recover', 'rec-later']]) {
       if (open(scr)) { document.getElementById(btn)?.click(); return; }
     }
-    if (open('scr-over')) { if (now() - S.overAt > 4000) document.getElementById('btn-again')?.click(); return; }
-    if (open('scr-menu') && now() - S.lastPlay > 6000 && now() - S.overAt > 5000) {
+    if (open('scr-over')) {
+      if (now() - S.overAt > 4000 && now() - (S.againAt || 0) > 2000) { S.againAt = now(); document.getElementById('btn-again')?.click(); }
+      return;
+    }
+    // 多人：跑完會回到房間（scr-lobby），只有房主能開下一局。
+    // 遊戲自己會把 lobby-start 隱藏（訪客）或 disable（人數不足 / 有人還在連線），照它的判斷走就好。
+    if (open('scr-lobby')) {
+      const btn = document.getElementById('lobby-start');
+      if (btn && !btn.classList.contains('hidden') && !btn.disabled && now() - (S.lobbyAt || 0) > 5000) {
+        S.lobbyAt = now();
+        btn.click();
+        log('co-op: start next run');
+      }
+      return;
+    }
+    // 還在房間裡就別去點單人的「開始」——那會直接開一場單人、把房間丟掉。
+    // 訪客在房間裡唯一能做的就是等房主，這裡什麼都不做才是對的。
+    const inRoom = !!(ns.Room && ns.Room.room);
+    if (!inRoom && open('scr-menu') && now() - S.lastPlay > 6000 && now() - S.overAt > 5000) {
       S.lastPlay = now();
       document.querySelector('#scr-menu [data-go=play]')?.click();
     }
