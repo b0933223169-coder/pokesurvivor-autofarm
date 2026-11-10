@@ -19,7 +19,7 @@
   try { Object.defineProperty(window, GUARD, { value: 1, configurable: true }); } catch { window[GUARD] = 1; }
 
   const STORE_KEY = 'psbot.v1';
-  const VERSION = '1.8.18';   // 改程式時記得跟 manifest.json 一起改，面板標題會顯示，用來確認瀏覽器跑的是不是新版
+  const VERSION = '1.9.0';   // 改程式時記得跟 manifest.json 一起改，面板標題會顯示，用來確認瀏覽器跑的是不是新版
   const log = (...a) => console.log('%c[PSBot]', 'color:#ff8ad8', ...a);
   let capturedNs = null;
 
@@ -192,6 +192,21 @@
     farm: true,        // 養怪：有範圍招時繞小圈讓怪擠成一團，範圍招一次打一大片（場上 ≥54 隻時新怪變精英，經驗 ×1.6）
     lead: false,       // 預判射擊（實戰會描邊，預設關：直接打怪現在的位置，配合「拉開距離 / 站樁」走位）
     focus: true,       // 集火：接管遊戲的「手動瞄準」，單體彈一次只打一隻，挑打得死的先收
+    // 記錄模式：由你自己打，bot 完全不介入，只記錄你選了哪些卡 / 羈絆 / 道具、走位離怪多遠、血壓多低。
+    // 停止記錄後，下一局開始自動判斷就會參考這些偏好（參數會一直累積，可匯出 / 匯入）
+    record: false,
+    learn: {
+      v: 1,
+      runs: 0,          // 總共記錄了幾局
+      picks: 0,         // 總共記錄了幾次選擇（卡 / 羈絆 / 道具）
+      cards: {},        // 卡牌 key（type:id）→ { n: 被選次數, t: 出現次數 }
+      bonds: {},        // 招式 id → { n, t }
+      items: {},        // 道具 id → { n, t }
+      move: { n: 0, hp: 0, dist: 0, min: null },   // 走位樣本：樣本數、血量總和、最近怪距離總和、單局最低血量
+      heal: { n: 0, hp: 0 },                       // 你選「補血」卡當下的血量（用來推 bot 的補血門檻）
+      last: null,       // 最後一局 { at, time, level, kills }
+      updatedAt: 0,
+    },
     // 每隻寶可夢的畢業配置：招式依序學習、依序建立羈絆；item = 想要的攜帶道具
     profiles: {
       // 超夢：精神強念（12 發追蹤、穿透）排在詭計前面：念力 + 精神強念每秒輸出約是念力 + 詭計的 1.8 倍，
@@ -204,6 +219,11 @@
   try { cfg = Object.assign({}, DEFAULTS, JSON.parse(localStorage.getItem(STORE_KEY) || '{}')); }
   catch { cfg = Object.assign({}, DEFAULTS); }
   cfg.profiles = Object.assign({}, DEFAULTS.profiles, cfg.profiles);
+  // 記錄模式的參數：舊存檔沒有就補預設；缺欄位（或匯入別人的舊檔）也一併補齊
+  cfg.learn = Object.assign({}, DEFAULTS.learn, cfg.learn || {});
+  for (const k of ['cards', 'bonds', 'items']) cfg.learn[k] = Object.assign({}, cfg.learn[k] || {});
+  cfg.learn.move = Object.assign({}, DEFAULTS.learn.move, cfg.learn.move || {});
+  cfg.learn.heal = Object.assign({}, DEFAULTS.learn.heal, cfg.learn.heal || {});
   // 舊版內建的妙蛙種子 / 蓋歐卡配置不符合「開局招式 → 變硬 → 劍舞 / 詭計 → 範圍攻擊」，存檔裡還是原樣的就刪掉，改走自動模式
   for (const [dex, old] of Object.entries({ 1: 'energy-ball,nasty-plot,leaf-storm,giga-drain', 382: 'bubble,nasty-plot,aqua-ring,hydro-pump' }))
     if (cfg.profiles[dex] && (cfg.profiles[dex].moves || []).join() === old) delete cfg.profiles[dex];
@@ -216,7 +236,7 @@
   // ---------- 3. 主程式 ----------
   function boot(ns) {
     // 除錯用：放在 Symbol 下，不可列舉，避免 window 上的明字鍵名觸發偵測
-    try { Object.defineProperty(window, Symbol.for('psbot.debug'), { value: { ns, cfg, stats, S }, configurable: true }); } catch {}
+    try { Object.defineProperty(window, Symbol.for('psbot.debug'), { value: { ns, cfg, stats, S, learn: { exportLearn, importLearnFile, mergeLearn, resetLearn, cardBias, bondBias, itemBias, learnedMove, fearModel, healThreshold } }, configurable: true }); } catch {}
     log('namespace captured, version', VERSION);
     // 核心模組都認出來、DOM 也好了才 patch。其他模組晚一點就緒沒關係（用到的地方都有防護）。
     const need = ['Game', 'Input', 'RunUI', 'LevelUp', 'Moves', 'DEX_BY', 'UI', 'T'];
@@ -235,7 +255,7 @@
     }, 50);
   }
 
-  const S = { pickTimer: null, lastPos: null, stuckT: 0, unstickT: 0, unstickDir: null, wanderA: Math.random() * 6.28, lastSlotCheck: 0, lastOrb: 0, lastT: performance.now(), overAt: -1e9, againAt: -1e9, lobbyAt: -1e9, coopFull: true, fullLogAt: -1e9, lastPlay: -1e9, pausedAt: 0, userPausedAt: -1e9, lastDir: null, lastOffer: null, orbGoal: null, plan: null, seen: {}, ban: {}, noGo: {}, jCenter: null, holding: false, holdKey: null, holdSince: 0, wd: null, losBadT: 0, spin: 1, spinBlockT: 0, loopC: null, dirIdx: -1, holdT: 0, out: [1, 0] };
+  const S = { pickTimer: null, lastPos: null, stuckT: 0, unstickT: 0, unstickDir: null, wanderA: Math.random() * 6.28, lastSlotCheck: 0, lastOrb: 0, lastT: performance.now(), overAt: -1e9, againAt: -1e9, lobbyAt: -1e9, coopFull: true, fullLogAt: -1e9, lastPlay: -1e9, pausedAt: 0, userPausedAt: -1e9, lastDir: null, lastOffer: null, orbGoal: null, plan: null, seen: {}, ban: {}, noGo: {}, jCenter: null, holding: false, holdKey: null, holdSince: 0, wd: null, losBadT: 0, spin: 1, spinBlockT: 0, loopC: null, dirIdx: -1, holdT: 0, out: [1, 0], rec: { cards: null, runActive: false, runMin: 1, saveAt: 0 }, recMsg: '', recMsgAt: 0 };
 
   function patch(ns) {
     // --- 走位：接管 Input.axis()，玩家自己按方向鍵時讓玩家優先 ---
@@ -243,25 +263,58 @@
     ns.Input.axis = function () {
       const manual = origAxis();
       if (manual && (manual[0] || manual[1])) return manual;
-      if (!cfg.on || !cfg.move) return manual;
+      // 記錄模式：走位完全交給你
+      if (!cfg.on || !cfg.move || cfg.record) return manual;
       try { return steer(ns); } catch (e) { console.warn('[PSBot] steer', e); return manual; }
     };
 
     // --- 升級選卡 ---
-    // 記住最後一次發的卡（重抽時 RunUI 會再呼叫 LevelUp.offer）
+    // 記住最後一次發的卡（重抽時 RunUI 會再呼叫 LevelUp.offer，這裡也順便記下重抽後的新卡）
     const origOffer = ns.LevelUp.offer;
-    ns.LevelUp.offer = function () { return (S.lastOffer = origOffer.apply(this, arguments)); };
+    ns.LevelUp.offer = function () {
+      const r = origOffer.apply(this, arguments);
+      S.lastOffer = r;
+      if (cfg.record && Array.isArray(r)) learnOffer('cards', r.map(c => c.key));
+      return r;
+    };
     const R = ns.RunUI;
     const origLevel = R.showLevelUp;
     R.showLevelUp = function (level, cards, cb, coop) {
       const r = origLevel.apply(this, arguments);
-      if (cfg.on && cfg.cards) schedule(() => chooseCard(ns, cards), 700);
+      if (cfg.record) {
+        // 記錄模式：不動手，只記下這次發了哪些卡；你按了哪張由下面的 pick 攔截
+        S.rec.cards = cards;
+        S.lastOffer = cards;
+      } else if (cfg.on && cfg.cards) schedule(() => chooseCard(ns, cards), 700);
       return r;
+    };
+    const origPick = R.pick;
+    R.pick = function (i) {
+      if (cfg.record) {
+        // 重抽後 S.lastOffer 才是畫面上真正顯示的卡
+        const list = S.lastOffer || S.rec.cards;
+        const c = list && list[i];
+        if (c) {
+          const p = ns.Game.player;
+          learnPick('cards', c.key, p ? p.hp / p.maxHp : null);
+        }
+        S.rec.cards = null;
+      }
+      return origPick.apply(this, arguments);
     };
 
     // --- 羈絆 ---
     const origBond = R.showBond;
     R.showBond = function (opt, cb) {
+      if (cfg.record) {
+        // 你選完後遊戲會把選中的招式陣列交給 cb，在這裡攔下來記錄（pair 模式會是兩個）
+        learnOffer('bonds', opt.loose.map(m => m.id));
+        const wrapped = function (picked) {
+          learnPicks('bonds', (picked || []).map(m => m.id));
+          return cb.apply(this, arguments);
+        };
+        return origBond.call(this, opt, wrapped);
+      }
       const r = origBond.apply(this, arguments);
       if (cfg.on && cfg.bonds) schedule(() => chooseBond(ns, opt), 700);
       return r;
@@ -270,6 +323,14 @@
     // --- 攜帶道具二選一 ---
     const origItem = R.showItemChoice;
     R.showItemChoice = function (cur, next, cb) {
+      if (cfg.record) {
+        learnOffer('items', [cur, next]);
+        const wrapped = function (picked) {
+          learnPick('items', picked);
+          return cb.apply(this, arguments);
+        };
+        return origItem.call(this, cur, next, wrapped);
+      }
       const r = origItem.apply(this, arguments);
       if (cfg.on && cfg.items) schedule(() => {
         const keep = itemRank(ns, cur) <= itemRank(ns, next);
@@ -282,6 +343,9 @@
     // --- 結算 / 自動再來一局 ---
     const origOver = R.showOver;
     R.showOver = function (d) {
+      // 記錄模式：這一局算一局樣本（走位最低血量、局數）。先記再交給遊戲畫結算，
+      // 就算結算畫面出錯也不會掉樣本。
+      if (cfg.record) finishLearnRun(d);
       const r = origOver.apply(this, arguments);
       if (cfg.on) {
         stats.runs++; stats.kills += d.kills || 0; stats.coins += d.coins || 0;
@@ -312,6 +376,8 @@
     // --- 每 200ms 的雜務：切換主動欄位、用寶珠、自動再開一局、被暫停就繼續 ---
     // coopFull：多人第一次開局要等房間滿。關掉 bot 就重置，下次開啟重新要求滿房。
     setInterval(() => {
+      // 記錄模式：只取樣人類的走位，其他自動功能全部停手（由你自己打）
+      if (cfg.record) { try { sampleHuman(ns); } catch (e) { console.warn('[PSBot] record', e); } return; }
       if (!cfg.on) { S.coopFull = true; return; }
       try {
         // 已經進場（不管是 bot 開的還是你手動開的）→ 這一輪就沿用這個組合，之後不再要求滿房
@@ -323,6 +389,171 @@
   }
 
   function schedule(fn, ms) { setTimeout(() => { try { fn(); } catch (e) { console.warn('[PSBot]', e); } }, ms); }
+
+  // ---------- 3b. 記錄模式：從人類的選擇 / 走位學參數 ----------
+  // 卡牌 / 羈絆 / 道具用「偏好計數」：同一張卡出現 t 次、被人類選了 n 次，
+  // 用 Laplace 平滑算偏好率（0.5 = 沒偏好），再換算成分數微調；樣本少於 3 次不影響判斷。
+  // 走位只記平均值（血量、最近怪距離）與單局最低血量，換算成「恐懼係數」與補血門檻。
+  const LEARN_BAGS = ['cards', 'bonds', 'items'];
+
+  function learnOffer(bag, keys) {
+    const B = cfg.learn[bag] || (cfg.learn[bag] = {});
+    for (const k of new Set(keys.filter(Boolean))) {
+      const e = B[k] || (B[k] = { n: 0, t: 0 });
+      e.t++;
+    }
+    cfg.learn.updatedAt = Date.now();
+  }
+  function learnPick(bag, key, hp) {
+    if (!key) return;
+    const B = cfg.learn[bag] || (cfg.learn[bag] = {});
+    const e = B[key] || (B[key] = { n: 0, t: 0 });
+    e.n++;
+    // 你選補血卡當下的血量：這是最直接的「什麼時候該補」訊號
+    if (bag === 'cards' && key === 'stat:heal' && typeof hp === 'number' && isFinite(hp)) {
+      const H = cfg.learn.heal;
+      H.n++; H.hp += Math.max(0, Math.min(1, hp));
+    }
+    cfg.learn.picks++;
+    cfg.learn.updatedAt = Date.now();
+  }
+  function learnPicks(bag, keys) { for (const k of keys) learnPick(bag, k); }
+  // 偏好率 -0.5 ~ +0.5（出現次數太少就當作沒意見）
+  function prefOf(bag, key) {
+    const e = cfg.learn[bag] && cfg.learn[bag][key];
+    if (!e || (e.t | 0) < 3) return 0;
+    return (e.n + 1) / (e.t + 2) - 0.5;
+  }
+  function cardBias(key) { return prefOf('cards', key) * 400; }   // 分數 ±200
+  function bondBias(id) { return prefOf('bonds', id) * 6; }       // 名次 ±3
+  function itemBias(id) { return prefOf('items', id) * 6; }       // 名次 ±3
+
+  // 每 200ms 取樣一次人類的走位（升級 / 選卡畫面遊戲會暫停，那段不算，但不會中斷這一局的統計）
+  function sampleHuman(ns) {
+    const p = ns.Game.player;
+    if (!p) return;
+    // 換局（新的 player 物件）就重新計算單局最低血量
+    if (S.rec.player !== p) { S.rec.player = p; S.rec.runMin = 1; }
+    const hp = Math.max(0, Math.min(1, p.hp / p.maxHp));
+    if (hp < S.rec.runMin) S.rec.runMin = hp;
+    if (p.dead || ns.Game.state !== 'playing') return;
+    let d = 400;   // 最近的怪（小偷不會打人，不算）
+    for (const e of ns.EnemyMgr.all()) {
+      if (e.dead || e.silent || e.behavior === 'thief') continue;
+      const dd = Math.hypot(e.x - p.x, e.y - p.y);
+      if (dd < d) d = dd;
+    }
+    const M = cfg.learn.move;
+    M.n++; M.hp += hp; M.dist += d;
+    cfg.learn.updatedAt = Date.now();
+    // 每 5 秒存一次，瀏覽器當掉也只掉幾秒的樣本
+    const t = performance.now();
+    if (t - (S.rec.saveAt || 0) > 5000) { S.rec.saveAt = t; save(); }
+  }
+  function finishLearnRun(d) {
+    const L = cfg.learn;
+    L.runs++;
+    if (S.rec.runMin != null) {
+      const M = L.move;
+      M.min = M.min == null ? S.rec.runMin : M.min * 0.7 + S.rec.runMin * 0.3;
+    }
+    S.rec.player = null;
+    S.rec.runActive = false;
+    L.last = { at: Date.now(), time: d.time || 0, level: d.level || 0, kills: d.kills || 0 };
+    L.updatedAt = Date.now();
+    save();
+    log(`record: run ${L.runs} · min HP ${Math.round((S.rec.runMin || 0) * 100)}%`);
+  }
+  // 人類的平均走位（樣本夠才回傳；200 筆 = 約 40 秒）
+  function learnedMove() {
+    const M = cfg.learn.move;
+    if (!M || (M.n | 0) < 200) return null;
+    return { hp: M.hp / M.n, dist: Math.min(400, M.dist / M.n), min: M.min };
+  }
+  // 補血卡門檻：優先看你選補血卡時的血量；沒有樣本就用你平常的血量打六折
+  function healThreshold() {
+    const H = cfg.learn.heal;
+    if (H && (H.n | 0) >= 2) return Math.max(0.25, Math.min(0.6, H.hp / H.n + 0.05));
+    const lm = learnedMove();
+    return lm ? Math.max(0.25, Math.min(0.5, lm.hp * 0.6)) : 0.35;
+  }
+  // 恐懼模型：人類平均血量高 / 站得遠 = 保守，門檻上移、恐懼放大；反過來就放寬
+  function fearModel() {
+    const lm = learnedMove();
+    if (!lm) return { low: 0.35, mid: 0.6, k: 1 };
+    const shift = Math.max(-0.12, Math.min(0.12, (lm.hp - 0.65) * 0.4));
+    const k = Math.max(0.7, Math.min(1.4, 0.9 + (lm.dist - 140) / 400 + (lm.hp - 0.65) * 0.8));
+    return { low: 0.35 + shift, mid: 0.6 + shift, k };
+  }
+
+  function learnMsg(t) { S.recMsg = t; S.recMsgAt = performance.now(); log(t); }
+  // 匯出：下載一份 JSON，可以給別人匯入
+  function exportLearn() {
+    try {
+      const data = { app: 'psbot', kind: 'learn', v: 1, at: new Date().toISOString(), learn: cfg.learn };
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `psbot-learn-${new Date().toISOString().slice(0, 10)}.json`;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+      learnMsg(`已匯出參數（${cfg.learn.runs} 局）`);
+    } catch (e) { learnMsg('匯出失敗：' + e.message); }
+  }
+  // 匯入：和現有參數「合併」，次數相加，所以可以一直累積
+  function mergeLearn(src) {
+    const L = cfg.learn;
+    const num = v => (typeof v === 'number' && isFinite(v) ? Math.max(0, v) : 0);
+    L.runs += num(src.runs);
+    L.picks += num(src.picks);
+    for (const bag of LEARN_BAGS) {
+      const dst = L[bag] || (L[bag] = {});
+      for (const [k, v] of Object.entries(src[bag] || {})) {
+        if (!v || typeof v !== 'object') continue;
+        const e = dst[k] || (dst[k] = { n: 0, t: 0 });
+        e.n += num(v.n); e.t += num(v.t);
+      }
+    }
+    const m = src.move;
+    if (m && typeof m === 'object' && num(m.n) > 0) {
+      const n = num(m.n), M = L.move;
+      M.hp += num(m.hp); M.dist += num(m.dist);
+      if (typeof m.min === 'number' && isFinite(m.min)) {
+        const oldN = M.n | 0;
+        M.min = M.min == null ? m.min : (M.min * oldN + m.min * n) / (oldN + n);
+      }
+      M.n += n;
+    }
+    const h = src.heal;
+    if (h && typeof h === 'object' && num(h.n) > 0) {
+      L.heal.n += num(h.n); L.heal.hp += num(h.hp);
+    }
+    if (src.last && typeof src.last === 'object') {
+      const n = v => (typeof v === 'number' && isFinite(v) ? v : 0);
+      L.last = { at: n(src.last.at) || Date.now(), time: n(src.last.time), level: n(src.last.level), kills: n(src.last.kills) };
+    }
+    L.updatedAt = Date.now();
+  }
+  function importLearnFile(file) {
+    const rd = new FileReader();
+    rd.onload = () => {
+      try {
+        const d = JSON.parse(String(rd.result));
+        const src = d && d.learn ? d.learn : (d && d.cards ? d : null);
+        if (!src || typeof src !== 'object') throw new Error('不是 PSBot 參數檔');
+        mergeLearn(src);
+        save();
+        learnMsg(`已匯入：累計 ${cfg.learn.runs} 局`);
+      } catch (e) { learnMsg('匯入失敗：' + e.message); }
+    };
+    rd.onerror = () => learnMsg('讀取檔案失敗');
+    rd.readAsText(file);
+  }
+  function resetLearn() {
+    cfg.learn = JSON.parse(JSON.stringify(DEFAULTS.learn));
+    save();
+    learnMsg('已清除學習參數');
+  }
 
   // ---------- 4. 選卡邏輯 ----------
   // 學習（經驗 ×1.12，最多 8 張 = ×2.48）越早拿越賺，排第一；磁鐵（吸取範圍 ×1.3）拿到約 260px 前也很優先，
@@ -382,7 +613,7 @@
 
   function scoreCard(ns, p, c) {
     const [type, id] = [c.type, String(c.key).split(':').slice(1).join(':')];
-    const lowHp = p.hp / p.maxHp < 0.35;
+    const lowHp = p.hp / p.maxHp < healThreshold();   // 記錄模式會依人類習慣調整補血時機
     if (type === 'evo') return 1000;
     if (type === 'new') return scoreNewMove(ns, p, id);
     // 招式進化 = 招式升到滿級 + 拿過一次指定的被動（例：念力要「反應」、精神強念要「磁鐵」）
@@ -418,7 +649,8 @@
     const p = ns.Game.player;
     if (!p || !ns.UI.isOpen('scr-levelup')) return;
     let best = 0, bestS = -Infinity;
-    cards.forEach((c, i) => { const s = scoreCard(ns, p, c); if (s > bestS) { bestS = s; best = i; } });
+    // 記錄模式學到的偏好只微調分數（±200），不會蓋掉進化 / 配置招式這些硬規則
+    cards.forEach((c, i) => { const s = scoreCard(ns, p, c) + cardBias(c.key); if (s > bestS) { bestS = s; best = i; } });
     // 沒有任何有用的卡（進化、配置招式、被動、往進化前進的升級都沒有）→ 有重抽次數就重抽
     const rr = document.getElementById('lvl-reroll');
     if (bestS < 500 && rr && !rr.classList.contains('hidden')) {
@@ -443,7 +675,8 @@
   function chooseBond(ns, opt) {
     const p = ns.Game.player;
     if (!p || !ns.UI.isOpen('scr-bond')) return;
-    const order = opt.loose.map((m, i) => ({ m, i })).sort((a, b) => bondRank(ns, p, a.m) - bondRank(ns, p, b.m));
+    const order = opt.loose.map((m, i) => ({ m, i })).sort((a, b) =>
+      (bondRank(ns, p, a.m) - bondBias(a.m.id)) - (bondRank(ns, p, b.m) - bondBias(b.m.id)));
     if (opt.mode === 'add') { log('bond add', order[0].m.id); return ns.RunUI.pickBond(order[0].i); }
     // pair：先選第一個，清單會重繪（扣掉第一個），再選第二個
     const first = order[0].m, second = order[1].m;
@@ -461,7 +694,7 @@
     const prof = profileOf(ns);
     if (prof && prof.item === id) return -1;
     const i = ITEM_PRI.indexOf(id);
-    return i < 0 ? 99 : i;
+    return (i < 0 ? 99 : i) - itemBias(id);   // 記錄模式學到的偏好：名次往前挪最多 3
   }
 
   // ---------- 7. 雜務：主動欄位 / 寶珠 ----------
@@ -927,8 +1160,11 @@
     const dt = Math.min(0.1, (now - S.lastT) / 1000); S.lastT = now;
     const gt = ns.Game.st.time;
     const hpPct = p.hp / p.maxHp;
-    // 血量健康時幾乎不躲小怪（超夢打得死），只躲首領 / 彈幕 / 地面預警；越殘越怕
-    let fear = hpPct < 0.35 ? 2.5 : hpPct < 0.6 ? 1 : 0.25;
+    // 血量健康時幾乎不躲小怪（超夢打得死），只躲首領 / 彈幕 / 地面預警；越殘越怕。
+    // 門檻與倍率會依「記錄模式學到的人類走位」微調；沒樣本時就是原本的 0.35 / 0.6 / ×1
+    const fm = fearModel();
+    let fear = hpPct < fm.low ? 2.5 : hpPct < fm.mid ? 1 : 0.25;
+    if (fm.k !== 1) fear *= fm.k;
     // 養怪：手上有範圍招、血量健康時，繞小圈讓怪全部擠在圈裡，範圍招一次打一整團。
     // 怪越多範圍招越賺（貝殼之鈴照傷害回血，打越多回越多），場上 ≥54 隻時新生的怪是精英（經驗 ×1.6）。
     // 血掉到 45% 以下就退回一般走位，回到 65% 再開
@@ -1683,6 +1919,12 @@
     <label><input type="checkbox" data-o="gacha">回主選單時自動抽獎（用抽獎券）</label>
     <label><input type="checkbox" data-o="autoPartner">自動換最強的寶可夢出戰</label>
   </div></details>
+  <details data-k="recBox" open><summary>記錄模式（你打，bot 學）</summary>
+    <div class="row"><button data-k="rec">● 開始記錄</button></div>
+    <div class="row"><button data-k="recExport">匯出參數</button><button data-k="recImport">匯入參數</button><button data-k="recClear">清除</button></div>
+    <div class="st" data-k="recInfo"></div>
+    <input type="file" data-k="recFile" accept=".json,application/json" style="display:none">
+  </details>
   <details data-k="histBox"><summary>戰績（最近 5 局）</summary><div class="st" data-k="hist"></div></details>
   <details data-k="buildBox" open><summary data-k="ptitle">畢業配置</summary>
     <div class="chips" data-k="build"></div>
@@ -1707,6 +1949,27 @@
     }, true);
     $('min').onclick = () => { cfg.collapsed = !cfg.collapsed; el.classList.toggle('min', cfg.collapsed); save(); };
     el.querySelectorAll('[data-o]').forEach(i => { i.checked = !!cfg[i.dataset.o]; i.onchange = () => { cfg[i.dataset.o] = i.checked; save(); }; });
+
+    // 記錄模式：開啟後 bot 全部停手，由你自己打；只記錄你的選擇與走位
+    function renderRec() {
+      const on = !!cfg.record, L = cfg.learn, lm = learnedMove();
+      $('rec').textContent = on ? '■ 停止記錄（錄影中）' : '● 開始記錄';
+      $('rec').classList.toggle('on', on);
+      const lines = [
+        `已記錄 ${L.runs} 局 · ${L.picks} 次選擇${on ? '（錄影中）' : ''}`,
+        lm ? `人類平均 HP ${Math.round(lm.hp * 100)}% · 離怪 ${Math.round(lm.dist)}px` +
+          ` · 補血門檻 ${Math.round(healThreshold() * 100)}%` : '走位樣本不足，再打一局',
+        L.last ? `上一局 ${Math.round(L.last.time)}s Lv${L.last.level} 擊倒 ${L.last.kills}` : '',
+        S.recMsg && performance.now() - S.recMsgAt < 8000 ? S.recMsg : '',
+      ].filter(Boolean);
+      $('recInfo').replaceChildren(...lines.map(t => Object.assign(document.createElement('div'), { textContent: t })));
+    }
+    $('rec').onclick = () => { cfg.record = !cfg.record; S.rec.runActive = false; S.rec.player = null; save(); renderRec(); };
+    $('recExport').onclick = exportLearn;
+    $('recImport').onclick = () => $('recFile').click();
+    $('recFile').onchange = e => { const f = e.target.files && e.target.files[0]; if (f) importLearnFile(f); e.target.value = ''; };
+    $('recClear').onclick = () => { if (confirm('清除所有已學習的參數？（已匯出的檔案不受影響）')) resetLearn(); };
+    renderRec();
     // 面板不要把按鍵 / 點擊漏給遊戲
     for (const t of ['pointerdown', 'mousedown', 'click', 'touchstart']) el.addEventListener(t, e => e.stopPropagation());
 
@@ -1761,10 +2024,11 @@
     $('item').onchange = () => { const dex = curDex(); if (!dex) return; prof(dex).item = $('item').value; save(); };
 
     setInterval(() => {
+      renderRec();
       renderBuild(false);
       const p = ns.Game.player, inRun = p && ns.Game.state !== 'ui';
       const xpLine = inRun ? `經驗 ×${(p.xpMul || 1).toFixed(2)} · 場上 ${ns.EnemyMgr.count ?? ns.EnemyMgr.all().length}/64${S.spawnLimited ? ' · 怪不夠打（學習優先）' : ''}\n` : '';
-      const run = inRun ? xpLine + `Lv${p.level} · HP ${Math.round(p.hp)}/${Math.round(p.maxHp)} · 擊倒 ${p.kills} · 羈絆券 ${p.bonds} · ${cfg.on ? S.mode || '' : '暫停'}\n欄位：${p.slots.map((g, i) => (i === p.active ? '▶' : '') + g.map(m => mvName(m.id)).join('+')).join(' | ')}` : '不在遊戲中';
+      const run = inRun ? xpLine + `Lv${p.level} · HP ${Math.round(p.hp)}/${Math.round(p.maxHp)} · 擊倒 ${p.kills} · 羈絆券 ${p.bonds} · ${cfg.record ? '記錄中（bot 停手）' : cfg.on ? S.mode || '' : '暫停'}\n欄位：${p.slots.map((g, i) => (i === p.active ? '▶' : '') + g.map(m => mvName(m.id)).join('+')).join(' | ')}` : '不在遊戲中';
       const mins = Math.round((Date.now() - stats.startedAt) / 60000);
       // 遊戲的 CSS 會吃掉換行，所以一行一個 div
       const extra = [S.lastPartnerMsg && '夥伴：' + S.lastPartnerMsg, S.lastUpgradeMsg && '強化：' + S.lastUpgradeMsg, S.lastGachaMsg && '抽到：' + S.lastGachaMsg].filter(Boolean);
