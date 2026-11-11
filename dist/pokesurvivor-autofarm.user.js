@@ -2,7 +2,7 @@
 // @name         PokéSurvivor 自動掛機 (PSBot)
 // @name:en      PokéSurvivor Auto-Farm (PSBot)
 // @namespace    https://github.com/b0933223169-coder/pokesurvivor-autofarm
-// @version      4.0.0
+// @version      5.0.0
 // @description  PokéSurvivor 自動走位躲招、選卡、綁羈絆、進神祕裂縫、處理事件（Gholdengo、求救、祭壇…）、自動再開一局
 // @description:en Auto movement & dodging, card picks, bonds, rifts, events (Gholdengo, rescues, altars…) and auto restart for PokéSurvivor
 // @author       BoundlessEgret
@@ -39,7 +39,7 @@
   try { Object.defineProperty(window, GUARD, { value: 1, configurable: true }); } catch { window[GUARD] = 1; }
 
   const STORE_KEY = 'psbot.v1';
-  const VERSION = '4.0.0';   // v4：完整參數提取 + AI 自主學習（self-play + ε-greedy）+ 組合邊
+  const VERSION = '5.0.0';   // v5：BOSS策略/生存/獎勵參數 + 死因追蹤 + 更多組合邊 + 匯出匯入擴充
   const log = (...a) => console.log('%c[PSBot]', 'color:#ff8ad8', ...a);
   let capturedNs = null;
 
@@ -230,6 +230,10 @@
     },
     // 知識圖譜（腦）：所有參數都是節點，關係是邊
     brain: { v: 1, nodes: {}, edges: [], updatedAt: 0 },
+    // 生存 / 獎勵 / BOSS 參數
+    surv: { healUrgent: 0.25, orbDanger: 0.4, retreatBoss: 330, rewardSafeHp: 0.5, rewardSafeDist: 200 },
+    boss: { prioritizeLowHp: true, prioritizeHighDmg: true, arceusFocus: false },
+    reward: { coinPriority: 2, xpPriority: 1, ticketPriority: 9 },
     // AI 自主學習：bot 自己打時也記錄並更新腦（不只學人類）
     selfLearn: true,
     exploreRate: 0.05,
@@ -284,6 +288,9 @@
   cfg.selfLearn = (cfg.selfLearn !== undefined) ? !!cfg.selfLearn : true;
   cfg.statPri = Object.assign({}, DEFAULTS.statPri, cfg.statPri || {});
   cfg.kindPri = Object.assign({}, DEFAULTS.kindPri, cfg.kindPri || {});
+  cfg.surv = Object.assign({}, DEFAULTS.surv, cfg.surv || {});
+  cfg.boss = Object.assign({}, DEFAULTS.boss, cfg.boss || {});
+  cfg.reward = Object.assign({}, DEFAULTS.reward, cfg.reward || {});
   // 舊版內建的妙蛙種子 / 蓋歐卡配置不符合「開局招式 → 變硬 → 劍舞 / 詭計 → 範圍攻擊」，存檔裡還是原樣的就刪掉，改走自動模式
   for (const [dex, old] of Object.entries({ 1: 'energy-ball,nasty-plot,leaf-storm,giga-drain', 382: 'bubble,nasty-plot,aqua-ring,hydro-pump' }))
     if (cfg.profiles[dex] && (cfg.profiles[dex].moves || []).join() === old) delete cfg.profiles[dex];
@@ -618,7 +625,8 @@
     // 局歷史
     if (!Array.isArray(L.history)) L.history = [];
     L.history.push({ at: Date.now(), time: d.time || 0, level: d.level || 0, kills: d.kills || 0, q,
-      minHp: S.rec.runMin, avgHp, avgDist, cards: S.rec.runCards.slice(), bonds: S.rec.runBonds.slice(), items: S.rec.runItems.slice() });
+      minHp: S.rec.runMin, avgHp, avgDist, cards: S.rec.runCards.slice(), bonds: S.rec.runBonds.slice(), items: S.rec.runItems.slice(),
+      bosses: d.bosses || 0, coins: d.coins || 0, dead: !!d.dead, breakdown: d.breakdown || '' });
     if (L.history.length > 30) L.history = L.history.slice(-30);
     S.rec.player = null;
     S.rec.runActive = false;
@@ -785,6 +793,18 @@
     { id: 'cfg.record', label: '記錄模式', cat: 'core', type: 'bool', def: false, desc: '人類示範' },
     { id: 'cfg.selfLearn', label: '自主學習', cat: 'core', type: 'bool', def: true, desc: 'bot 自己學' },
     { id: 'cfg.exploreRate', label: '探索率', cat: 'brain', type: 'number', def: 0.05, min: 0, max: 0.3, step: 0.01, desc: 'epsilon-greedy 探索' },
+    // --- 生存 / 獎勵 / BOSS ---
+    { id: 'surv.healUrgent', label: '緊急補血線', cat: 'survival', type: 'number', def: 0.25, min: 0.1, max: 0.5, step: 0.01, desc: '低於此血量最優先補血' },
+    { id: 'surv.orbDanger', label: '寶珠危險線', cat: 'survival', type: 'number', def: 0.4, min: 0.1, max: 0.7, step: 0.05, desc: '低於此血量用寶珠' },
+    { id: 'surv.retreatBoss', label: 'BOSS迴避距離', cat: 'survival', type: 'number', def: 330, min: 200, max: 500, step: 10, desc: 'BOSS接近時保持距離' },
+    { id: 'surv.rewardSafeHp', label: '撿獎勵最低血量', cat: 'survival', type: 'number', def: 0.5, min: 0.2, max: 0.8, step: 0.05, desc: '血量低於此不撿獎勵' },
+    { id: 'surv.rewardSafeDist', label: '撿獎勵安全距離', cat: 'survival', type: 'number', def: 200, min: 100, max: 400, step: 10, desc: '周圍敵人距離超過此值才撿' },
+    { id: 'boss.prioritizeLowHp', label: '優先低血BOSS', cat: 'boss', type: 'bool', def: true, desc: '優先攻擊血量最低的BOSS' },
+    { id: 'boss.prioritizeHighDmg', label: '優先高傷BOSS', cat: 'boss', type: 'bool', def: true, desc: '優先攻擊傷害最高的BOSS' },
+    { id: 'boss.arceusFocus', label: '阿爾宙斯優先', cat: 'boss', type: 'bool', def: false, desc: '審判時優先打阿爾宙斯' },
+    { id: 'reward.coinPriority', label: '金幣優先度', cat: 'reward', type: 'number', def: 2, min: 0, max: 5, step: 0.5, desc: '金幣拾取優先度' },
+    { id: 'reward.xpPriority', label: '經驗優先度', cat: 'reward', type: 'number', def: 1, min: 0, max: 5, step: 0.5, desc: '經驗球拾取優先度' },
+    { id: 'reward.ticketPriority', label: '抽獎券優先度', cat: 'reward', type: 'number', def: 9, min: 0, max: 15, step: 1, desc: '抽獎券拾取優先度' },
     // --- 移動 / 戰鬥 ---
     { id: 'steer.fearLow', label: '恐懼門檻(低血)', cat: 'movement', type: 'number', def: 0.35, min: 0.15, max: 0.6, step: 0.01, humanTrackable: true, humanSource: 'learn.params.fearLow', desc: '低血量時恐懼係數切換點' },
     { id: 'steer.fearMid', label: '恐懼門檻(中血)', cat: 'movement', type: 'number', def: 0.6, min: 0.4, max: 0.8, step: 0.01, humanTrackable: true, humanSource: 'learn.params.fearMid', desc: '中血量時恐懼係數切換點' },
@@ -823,13 +843,13 @@
     { id: 'brain.minEvidence', label: '最小證據數', cat: 'brain', type: 'number', def: 3, min: 1, max: 10, step: 1, desc: '生效所需樣本' },
     { id: 'brain.historySize', label: '歷史局數', cat: 'brain', type: 'number', def: 30, min: 10, max: 100, step: 5, desc: '保留局數' },
   ];
-  const BRAIN_CATS = ['core', 'movement', 'learning', 'scoring', 'brain'];
-  const BRAIN_CAT_LABEL = { core: '核心開關', movement: '移動/戰鬥', learning: '學習強度', scoring: '選卡評分', brain: '腦超參數' };
+  const BRAIN_CATS = ['core', 'movement', 'learning', 'scoring', 'survival', 'boss', 'reward', 'brain'];
+  const BRAIN_CAT_LABEL = { core: '核心開關', movement: '移動/戰鬥', learning: '學習強度', scoring: '選卡評分', survival: '生存/獎勵', boss: 'BOSS策略', reward: '獎勵優先', brain: '腦超參數' };
 
   // 取得參數當前值（依 id 路徑）
   function brainGet(id) {
     const parts = id.split('.');
-    let o = (parts[0] === 'cfg') ? cfg : (parts[0] === 'learn') ? cfg.learn : (parts[0] === 'steer') ? cfg.steer : (parts[0] === 'score') ? null : (parts[0] === 'statPri') ? cfg.statPri : (parts[0] === 'brain') ? cfg.brain : null;
+    let o = (parts[0] === 'cfg') ? cfg : (parts[0] === 'learn') ? cfg.learn : (parts[0] === 'steer') ? cfg.steer : (parts[0] === 'score') ? null : (parts[0] === 'statPri') ? cfg.statPri : (parts[0] === 'surv') ? (cfg.surv || (cfg.surv = {})) : (parts[0] === 'boss') ? (cfg.boss || (cfg.boss = {})) : (parts[0] === 'reward') ? (cfg.reward || (cfg.reward = {})) : (parts[0] === 'brain') ? cfg.brain : null;
     // score 特殊：cfg 沒有 score，用 cfg.learn.params 或 cfg.steer
     if (parts[0] === 'score') {
       if (parts[1] === 'passiveFirst') return cfg.passiveFirst;
@@ -849,7 +869,7 @@
       if (parts[1] === 'cdWeight') { cfg.steer.cdWeight = v; return; }
       return;
     }
-    let o = (parts[0] === 'cfg') ? cfg : (parts[0] === 'learn') ? cfg.learn : (parts[0] === 'steer') ? cfg.steer : (parts[0] === 'statPri') ? cfg.statPri : (parts[0] === 'brain') ? cfg.brain : null;
+    let o = (parts[0] === 'cfg') ? cfg : (parts[0] === 'learn') ? cfg.learn : (parts[0] === 'steer') ? cfg.steer : (parts[0] === 'statPri') ? cfg.statPri : (parts[0] === 'surv') ? (cfg.surv || (cfg.surv = {})) : (parts[0] === 'boss') ? (cfg.boss || (cfg.boss = {})) : (parts[0] === 'reward') ? (cfg.reward || (cfg.reward = {})) : (parts[0] === 'brain') ? cfg.brain : null;
     if (!o) return;
     const keys = parts.slice(1);
     for (let i = 0; i < keys.length - 1; i++) { if (o[keys[i]] == null) o[keys[i]] = {}; o = o[keys[i]]; }
@@ -927,6 +947,10 @@
       ['steer.springHp', 'concept:survival'], ['steer.magnetBase', 'concept:efficiency'],
       ['steer.farmHpOn', 'concept:efficiency'], ['steer.farmHpOff', 'concept:safety'],
       ['cfg.focus', 'concept:efficiency'], ['cfg.passiveFirst', 'concept:xp_gain'],
+      ['surv.healUrgent', 'concept:survival'], ['surv.orbDanger', 'concept:survival'],
+      ['surv.retreatBoss', 'concept:safety'], ['surv.rewardSafeHp', 'concept:survival'],
+      ['boss.prioritizeLowHp', 'concept:efficiency'], ['boss.arceusFocus', 'concept:survival'],
+      ['reward.xpPriority', 'concept:xp_gain'], ['reward.coinPriority', 'concept:efficiency'],
     ];
     // 組合邊：參數交互（fearLow × retreatDist → safety 等）
     const combos = [
@@ -996,7 +1020,7 @@
     try {
       buildBrain();
       const data = { app: 'psbot', kind: 'brain', v: 1, at: new Date().toISOString(),
-        cfg: { on: cfg.on, move: cfg.move, cards: cfg.cards, bonds: cfg.bonds, items: cfg.items, rift: cfg.rift, orbs: cfg.orbs, restart: cfg.restart, noRank: cfg.noRank, farm: cfg.farm, focus: cfg.focus, passiveFirst: cfg.passiveFirst, record: cfg.record, steer: cfg.steer, profiles: cfg.profiles },
+        cfg: { on: cfg.on, move: cfg.move, cards: cfg.cards, bonds: cfg.bonds, items: cfg.items, rift: cfg.rift, orbs: cfg.orbs, restart: cfg.restart, noRank: cfg.noRank, farm: cfg.farm, focus: cfg.focus, passiveFirst: cfg.passiveFirst, record: cfg.record, selfLearn: cfg.selfLearn, exploreRate: cfg.exploreRate, steer: cfg.steer, statPri: cfg.statPri, surv: cfg.surv, boss: cfg.boss, reward: cfg.reward, profiles: cfg.profiles },
         learn: cfg.learn, brain: cfg.brain };
       const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
       const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
@@ -1017,9 +1041,14 @@
         if (!src) throw new Error('不是 PSBot 腦檔案');
         if (src.cfg && typeof src.cfg === 'object') {
           if (src.cfg.steer) Object.assign(cfg.steer, src.cfg.steer);
-          for (const k of ['move','cards','bonds','items','rift','orbs','restart','noRank','farm','focus','passiveFirst']) {
+          if (src.cfg.statPri) Object.assign(cfg.statPri, src.cfg.statPri);
+          if (src.cfg.surv) Object.assign(cfg.surv, src.cfg.surv);
+          if (src.cfg.boss) Object.assign(cfg.boss, src.cfg.boss);
+          if (src.cfg.reward) Object.assign(cfg.reward, src.cfg.reward);
+          for (const k of ['move','cards','bonds','items','rift','orbs','restart','noRank','farm','focus','passiveFirst','selfLearn']) {
             if (typeof src.cfg[k] === 'boolean') cfg[k] = src.cfg[k];
           }
+          if (typeof src.cfg.exploreRate === 'number' && isFinite(src.cfg.exploreRate)) cfg.exploreRate = src.cfg.exploreRate;
         }
         if (src.learn) mergeLearn(src.learn);
         if (src.brain && src.brain.nodes) {
@@ -1119,7 +1148,7 @@
       ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
     }
     // 節點
-    const catColor = { core: '#ff8ad8', movement: '#4aa3ff', learning: '#ffd23f', scoring: '#9fb1c9', brain: '#c084fc', preference: '#5ac878', concept: '#ff6b6b' };
+    const catColor = { core: '#ff8ad8', movement: '#4aa3ff', learning: '#ffd23f', scoring: '#9fb1c9', survival: '#ff6b6b', boss: '#ff9f43', reward: '#54a0ff', brain: '#c084fc', preference: '#5ac878', concept: '#ee5a24' };
     for (const n of nodes) {
       const p = pos[n.id];
       if (!p) continue;
@@ -1874,11 +1903,17 @@
     const lockedFrom = (x, y) => {
       const fe = cfg.focus && S.focusEnemy && !S.focusEnemy.dead && !S.focusEnemy.arceus ? S.focusEnemy : null;
       if (fe && Math.hypot(fe.x - x, fe.y - y) < 520) return fe;   // 集火中：看的是正在打的那隻
-      let boss = null, nearest = null, nd = 520;
+      let boss = null, bossScore = -Infinity, nearest = null, nd = 520;
       for (const e of aimTargets) {
         if (e.arceus) continue;   // 阿爾宙斯打不死，不為了打牠去換位置（舊版會在牠身邊找射擊角度，直接走過去送死）
         const d = Math.hypot(e.x - x, e.y - y);
-        if (e.boss && d < 330) boss = e;
+        if (e.boss && d < 330) {
+          // 優先攻擊：血量最低（最容易擊殺）+ 傷害最高（最危險）的 boss
+          // 不是「第一支打完才打第二支」，而是同時考慮所有 boss 的威脅
+          const hpRatio = e.maxHp > 0 ? (e.hp || 0) / e.maxHp : 1;
+          const threat = (e.dmg || 10) * (1 - hpRatio * 0.5) / Math.max(1, d);
+          if (threat > bossScore) { bossScore = threat; boss = e; }
+        }
         if (d < nd) { nd = d; nearest = e; }
       }
       return boss || nearest;
