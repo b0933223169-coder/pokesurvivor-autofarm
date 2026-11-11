@@ -19,7 +19,7 @@
   try { Object.defineProperty(window, GUARD, { value: 1, configurable: true }); } catch { window[GUARD] = 1; }
 
   const STORE_KEY = 'psbot.v1';
-  const VERSION = '7.0.0';   // v7：傳送門風險評估 + 死因追蹤 + portal參數學習 + 更多組合邊
+  const VERSION = '8.0.0';   // v8：per-Pokémon brain profiles + 回血池安全評估 + 死因追蹤 + 更多參數
   const log = (...a) => console.log('%c[PSBot]', 'color:#ff8ad8', ...a);
   let capturedNs = null;
 
@@ -210,6 +210,8 @@
     },
     // 知識圖譜（腦）：所有參數都是節點，關係是邊
     brain: { v: 1, nodes: {}, edges: [], updatedAt: 0 },
+    // 每隻寶可夢的腦（per-Pokémon brain profiles）
+    brains: {},   // { [dex]: brain }
     // 生存 / 獎勵 / BOSS 參數
     surv: { healUrgent: 0.25, orbDanger: 0.4, retreatBoss: 330, rewardSafeHp: 0.5, rewardSafeDist: 200 },
     boss: { prioritizeLowHp: true, prioritizeHighDmg: true, arceusFocus: false },
@@ -267,6 +269,7 @@
   cfg.brain = Object.assign({ v: 1, nodes: {}, edges: [], updatedAt: 0 }, cfg.brain || {});
   if (!cfg.brain.nodes || typeof cfg.brain.nodes !== 'object') cfg.brain.nodes = {};
   if (!Array.isArray(cfg.brain.edges)) cfg.brain.edges = [];
+  if (!cfg.brains || typeof cfg.brains !== 'object') cfg.brains = {};
   cfg.selfLearn = (cfg.selfLearn !== undefined) ? !!cfg.selfLearn : true;
   cfg.statPri = Object.assign({}, DEFAULTS.statPri, cfg.statPri || {});
   cfg.kindPri = Object.assign({}, DEFAULTS.kindPri, cfg.kindPri || {});
@@ -305,7 +308,7 @@
     }, 50);
   }
 
-  const S = { pickTimer: null, lastPos: null, stuckT: 0, unstickT: 0, unstickDir: null, wanderA: Math.random() * 6.28, lastSlotCheck: 0, lastOrb: 0, lastT: performance.now(), overAt: -1e9, againAt: -1e9, lobbyAt: -1e9, coopFull: true, fullLogAt: -1e9, lastPlay: -1e9, pausedAt: 0, userPausedAt: -1e9, lastDir: null, lastOffer: null, orbGoal: null, plan: null, seen: {}, ban: {}, noGo: {}, jCenter: null, holding: false, holdKey: null, holdSince: 0, wd: null, losBadT: 0, spin: 1, spinBlockT: 0, loopC: null, dirIdx: -1, holdT: 0, out: [1, 0], rec: { cards: null, runActive: false, runMin: 1, saveAt: 0, player: null, runCards: [], runBonds: [], runItems: [], runHpSum: 0, runHpN: 0, runDistSum: 0, runDistN: 0, runStartedAt: 0 }, recMsg: '', recMsgAt: 0 };
+  const S = { pickTimer: null, lastPos: null, stuckT: 0, unstickT: 0, unstickDir: null, wanderA: Math.random() * 6.28, lastSlotCheck: 0, lastOrb: 0, lastT: performance.now(), overAt: -1e9, againAt: -1e9, lobbyAt: -1e9, coopFull: true, fullLogAt: -1e9, lastPlay: -1e9, pausedAt: 0, userPausedAt: -1e9, lastDir: null, lastOffer: null, orbGoal: null, plan: null, seen: {}, ban: {}, noGo: {}, jCenter: null, holding: false, holdKey: null, holdSince: 0, wd: null, losBadT: 0, spin: 1, spinBlockT: 0, loopC: null, dirIdx: -1, holdT: 0, out: [1, 0], rec: { cards: null, runActive: false, runMin: 1, saveAt: 0, player: null, dex: null, runCards: [], runBonds: [], runItems: [], runHpSum: 0, runHpN: 0, runDistSum: 0, runDistN: 0, runStartedAt: 0 }, recMsg: '', recMsgAt: 0 };
 
   function patch(ns) {
     // --- 走位：接管 Input.axis()，玩家自己按方向鍵時讓玩家優先 ---
@@ -429,6 +432,18 @@
       // 記錄模式：只取樣人類的走位，其他自動功能全部停手（由你自己打）
       if (cfg.record) { try { sampleHuman(ns); } catch (e) { console.warn('[PSBot] record', e); } return; }
       if (!cfg.on) { S.coopFull = true; return; }
+      // per-Pokémon brain switch (runs regardless of selfLearn)
+      try {
+        const p = ns.Game.player;
+        if (p && p.dex != null && S.rec.dex != null && S.rec.dex !== p.dex) {
+          cfg.brains[S.rec.dex] = JSON.parse(JSON.stringify(cfg.brain));
+          if (cfg.brains[p.dex]) cfg.brain = cfg.brains[p.dex];
+          else { cfg.brain = { v: 1, nodes: {}, edges: [], updatedAt: 0 }; buildBrain(); }
+          save();
+          log('brain switched: ' + S.rec.dex + ' -> ' + p.dex);
+        }
+        if (p && p.dex != null) S.rec.dex = p.dex;
+      } catch (e) {}
       // 自主學習：bot 自己打時也追蹤本局選擇與走位（供 finishLearnRun 使用）
       if (cfg.selfLearn) {
         try {
@@ -438,6 +453,24 @@
             S.rec.runCards = []; S.rec.runBonds = []; S.rec.runItems = [];
             S.rec.runHpSum = 0; S.rec.runHpN = 0; S.rec.runDistSum = 0; S.rec.runDistN = 0;
             S.rec.runStartedAt = Date.now();
+            // per-Pokémon brain switch
+            try {
+              const newDex = p.dex;
+              if (S.rec.dex != null && S.rec.dex !== newDex) {
+                // save current brain under old dex
+                cfg.brains[S.rec.dex] = JSON.parse(JSON.stringify(cfg.brain));
+                // load new dex brain or create
+                if (cfg.brains[newDex]) {
+                  cfg.brain = cfg.brains[newDex];
+                } else {
+                  cfg.brain = { v: 1, nodes: {}, edges: [], updatedAt: 0 };
+                  buildBrain();
+                }
+                save();
+                log('brain switched: ' + S.rec.dex + ' -> ' + newDex);
+              }
+              S.rec.dex = newDex;
+            } catch (e) { console.warn('[PSBot] brain switch', e); }
           }
           if (p && !p.dead && ns.Game.state === 'playing') {
             const hp = Math.max(0, Math.min(1, p.hp / p.maxHp));
@@ -530,6 +563,16 @@
   function sampleHuman(ns) {
     const p = ns.Game.player;
     if (!p) return;
+    // per-Pokémon brain switch
+    try {
+      if (S.rec.dex != null && S.rec.dex !== p.dex) {
+        cfg.brains[S.rec.dex] = JSON.parse(JSON.stringify(cfg.brain));
+        if (cfg.brains[p.dex]) cfg.brain = cfg.brains[p.dex];
+        else { cfg.brain = { v: 1, nodes: {}, edges: [], updatedAt: 0 }; buildBrain(); }
+        save();
+      }
+      S.rec.dex = p.dex;
+    } catch (e) {}
     // 換局（新的 player 物件）就重新計算單局最低血量與本局統計
     if (S.rec.player !== p) {
       S.rec.player = p; S.rec.runMin = 1;
@@ -1015,7 +1058,7 @@
       buildBrain();
       const data = { app: 'psbot', kind: 'brain', v: 1, at: new Date().toISOString(),
         cfg: { on: cfg.on, move: cfg.move, cards: cfg.cards, bonds: cfg.bonds, items: cfg.items, rift: cfg.rift, orbs: cfg.orbs, restart: cfg.restart, noRank: cfg.noRank, farm: cfg.farm, focus: cfg.focus, passiveFirst: cfg.passiveFirst, record: cfg.record, selfLearn: cfg.selfLearn, exploreRate: cfg.exploreRate, steer: cfg.steer, statPri: cfg.statPri, surv: cfg.surv, boss: cfg.boss, reward: cfg.reward, portal: cfg.portal, profiles: cfg.profiles },
-        learn: cfg.learn, brain: cfg.brain };
+        learn: cfg.learn, brain: cfg.brain, brains: cfg.brains };
       const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
       const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
       a.download = `psbot-brain-${new Date().toISOString().slice(0, 10)}.json`;
@@ -1046,6 +1089,32 @@
           if (typeof src.cfg.exploreRate === 'number' && isFinite(src.cfg.exploreRate)) cfg.exploreRate = src.cfg.exploreRate;
         }
         if (src.learn) mergeLearn(src.learn);
+        if (src.brains && typeof src.brains === 'object') {
+          for (const [dex, b] of Object.entries(src.brains)) {
+            if (!b || typeof b !== 'object') continue;
+            if (!cfg.brains[dex]) cfg.brains[dex] = JSON.parse(JSON.stringify(b));
+            else {
+              // merge brains
+              const ex = cfg.brains[dex];
+              for (const [id, n] of Object.entries(b.nodes || {})) {
+                if (!ex.nodes[id]) ex.nodes[id] = JSON.parse(JSON.stringify(n));
+                else {
+                  const w1 = ex.nodes[id].evidence || 1, w2 = n.evidence || 1;
+                  ex.nodes[id].value = (ex.nodes[id].value * w1 + (n.value || ex.nodes[id].value) * w2) / (w1 + w2);
+                  ex.nodes[id].evidence = (ex.nodes[id].evidence || 0) + (n.evidence || 0);
+                }
+              }
+              const key = e => e.from + '|' + e.to + '|' + e.rel;
+              const idx = new Map(ex.edges.map((e, i) => [key(e), i]));
+              for (const e of (b.edges || [])) {
+                if (!e || !e.from || !e.to) continue;
+                const i = idx.get(key(e));
+                if (i == null) { ex.edges.push(JSON.parse(JSON.stringify(e))); idx.set(key(e), ex.edges.length - 1); }
+                else { const ex2 = ex.edges[i]; const w1 = ex2.evidence || 1, w2 = e.evidence || 1; ex2.w = (ex2.w * w1 + (e.w || ex2.w) * w2) / (w1 + w2); ex2.evidence = (ex2.evidence || 0) + (e.evidence || 0); }
+              }
+            }
+          }
+        }
         if (src.brain && src.brain.nodes) {
           const B = cfg.brain;
           // 節點：union，值加權平均
@@ -1612,6 +1681,9 @@
     const portalHp = (cfg.portal && cfg.portal.enterHp != null) ? cfg.portal.enterHp : 0.7;
     const portalDist = (cfg.portal && cfg.portal.enterDist != null) ? cfg.portal.enterDist : 300;
     const nearEnemyDist = (function(){ let d=9999; for(const e of ns.EnemyMgr.all()){ if(e.dead) continue; d=Math.min(d,Math.hypot(e.x-p.x,e.y-p.y)); } return d; })();
+    // 回血池安全評估：周圍敵人距離
+    const springSafeDist = nearEnemyDist;
+    const springSafe = springSafeDist > 150 || hpPct < 0.25;  // 安全距離或緊急
     const lateGame = (ns.Game.st.time || 0) > 1200;
     const portalBonus = lateGame ? ((cfg.portal && cfg.portal.lateGameBonus) || 2.0) : 1.0;
     const portalSafe = hpPct > portalHp && nearEnemyDist > portalDist * 0.5;
@@ -1637,7 +1709,7 @@
     if (!ns.Rift.inArena && W && W.specialsNear) for (const o of W.specialsNear(p.x, p.y, 700)) {
       // 祭壇（25 秒 buff：傷害×2 / 速度 / 磁吸×4 / 冷卻-40%）、泉水（回血）、大寶箱（站 3.5 秒開箱）
       if (o.type === 'altar' && !o.used) out.push({ key: 'altar' + o.id, tier: 2, x: o.x, y: o.y, value: 5, left: Infinity, mode: '吃 buff', goalTol: 1, chase: true });
-      else if (o.type === 'spring' && hpPct < (((cfg.steer && cfg.steer.springHp) || 0.6)) && (o.charge ?? 1) > 0.2) out.push({ key: 'spring' + o.id, tier: 2, x: o.x, y: o.y - 8, value: 7, left: Infinity, mode: '泉水回血', goalTol: 0, hold: 20, until: () => p.hp >= p.maxHp * 0.95 });
+      else if (o.type === 'spring' && hpPct < (((cfg.steer && cfg.steer.springHp) || 0.6)) && (o.charge ?? 1) > 0.2 && (springSafe || hpPct < 0.25)) out.push({ key: 'spring' + o.id, tier: 2, x: o.x, y: o.y - 8, value: 7, left: Infinity, mode: '泉水回血', goalTol: 0, hold: 20, until: () => p.hp >= p.maxHp * 0.95 });
       else if (o.type === 'bigchest' && hpPct > 0.5) {
         // 遊戲的判定：站在離寶箱中心 46px 內滿 3.5 秒。寶箱本身是實心的，旁邊又常有樹，
         // 舊版走向寶箱中心、要求 34px 內才停，被樹擋住就一直蹭樹開不到。
@@ -2737,7 +2809,8 @@
       const groups = {};
       for (const n of filtered) { (groups[n.cat] = groups[n.cat] || []).push(n); }
       const lines = [];
-      lines.push(`節點 ${nodes.length} · 邊 ${ (B.edges||[]).length } · 匯入匯出可分享最優參數`);
+      const curDex = (S.rec && S.rec.dex) || (ns.Game.player && ns.Game.player.dex) || '?';
+      lines.push(`當前寶可夢 dex=${curDex} · 已存 ${Object.keys(cfg.brains||{}).length} 隻的腦 · 節點 ${nodes.length} · 邊 ${ (B.edges||[]).length }`);
       for (const cat of BRAIN_CATS) {
         const ns = groups[cat];
         if (!ns || !ns.length) continue;
