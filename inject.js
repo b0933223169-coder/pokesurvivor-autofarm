@@ -19,7 +19,7 @@
   try { Object.defineProperty(window, GUARD, { value: 1, configurable: true }); } catch { window[GUARD] = 1; }
 
   const STORE_KEY = 'psbot.v1';
-  const VERSION = '3.0.0';   // v3：知識圖譜（腦）— 所有參數都是節點，Hebbian 學習，Canvas 視覺化，匯出/匯入
+  const VERSION = '4.0.0';   // v4：完整參數提取 + AI 自主學習（self-play + ε-greedy）+ 組合邊
   const log = (...a) => console.log('%c[PSBot]', 'color:#ff8ad8', ...a);
   let capturedNs = null;
 
@@ -210,6 +210,12 @@
     },
     // 知識圖譜（腦）：所有參數都是節點，關係是邊
     brain: { v: 1, nodes: {}, edges: [], updatedAt: 0 },
+    // AI 自主學習：bot 自己打時也記錄並更新腦（不只學人類）
+    selfLearn: true,
+    exploreRate: 0.05,
+    // 選卡評分權重（原 STAT_PRI / KIND_PRI，現在可調 / 可學習）
+    statPri: { xp: 74, atk: 60, cd: 55, def: 45, hp: 40, rgn: 35, mag: 25, spd: 15, heal: 5 },
+    kindPri: { homing: 13, nova: 12, aura: 12, orbit: 11, chain: 10, projectile: 9, boomerang: 8, beam: 8, meteor: 8, turret: 7, mine: 6, cone: 6, melee: 4, dash: 3, trail: 3 },
     learn: {
       v: 2,             // v2：加入 outcome-aware 學習（依局數品質加權）
       runs: 0,          // 總共記錄了幾局
@@ -255,6 +261,9 @@
   cfg.brain = Object.assign({ v: 1, nodes: {}, edges: [], updatedAt: 0 }, cfg.brain || {});
   if (!cfg.brain.nodes || typeof cfg.brain.nodes !== 'object') cfg.brain.nodes = {};
   if (!Array.isArray(cfg.brain.edges)) cfg.brain.edges = [];
+  cfg.selfLearn = (cfg.selfLearn !== undefined) ? !!cfg.selfLearn : true;
+  cfg.statPri = Object.assign({}, DEFAULTS.statPri, cfg.statPri || {});
+  cfg.kindPri = Object.assign({}, DEFAULTS.kindPri, cfg.kindPri || {});
   // 舊版內建的妙蛙種子 / 蓋歐卡配置不符合「開局招式 → 變硬 → 劍舞 / 詭計 → 範圍攻擊」，存檔裡還是原樣的就刪掉，改走自動模式
   for (const [dex, old] of Object.entries({ 1: 'energy-ball,nasty-plot,leaf-storm,giga-drain', 382: 'bubble,nasty-plot,aqua-ring,hydro-pump' }))
     if (cfg.profiles[dex] && (cfg.profiles[dex].moves || []).join() === old) delete cfg.profiles[dex];
@@ -365,6 +374,7 @@
       const r = origItem.apply(this, arguments);
       if (cfg.on && cfg.items) schedule(() => {
         const keep = itemRank(ns, cur) <= itemRank(ns, next);
+        if (cfg.selfLearn && cfg.on) { const chosen = keep ? cur : next; if (!S.rec.runItems.includes(chosen)) S.rec.runItems.push(chosen); }
         const el = document.querySelectorAll('#item-cards .card')[keep ? 0 : 1];
         el && el.click();
       }, 700);
@@ -374,9 +384,8 @@
     // --- 結算 / 自動再來一局 ---
     const origOver = R.showOver;
     R.showOver = function (d) {
-      // 記錄模式：這一局算一局樣本（走位最低血量、局數）。先記再交給遊戲畫結算，
-      // 就算結算畫面出錯也不會掉樣本。
-      if (cfg.record) finishLearnRun(d);
+      // 記錄模式 或 自主學習：這一局算一局樣本
+      if (cfg.record || (cfg.on && cfg.selfLearn)) finishLearnRun(d);
       const r = origOver.apply(this, arguments);
       if (cfg.on) {
         stats.runs++; stats.kills += d.kills || 0; stats.coins += d.coins || 0;
@@ -410,6 +419,30 @@
       // 記錄模式：只取樣人類的走位，其他自動功能全部停手（由你自己打）
       if (cfg.record) { try { sampleHuman(ns); } catch (e) { console.warn('[PSBot] record', e); } return; }
       if (!cfg.on) { S.coopFull = true; return; }
+      // 自主學習：bot 自己打時也追蹤本局選擇與走位（供 finishLearnRun 使用）
+      if (cfg.selfLearn) {
+        try {
+          const p = ns.Game.player;
+          if (p && S.rec.player !== p) {
+            S.rec.player = p; S.rec.runMin = 1;
+            S.rec.runCards = []; S.rec.runBonds = []; S.rec.runItems = [];
+            S.rec.runHpSum = 0; S.rec.runHpN = 0; S.rec.runDistSum = 0; S.rec.runDistN = 0;
+            S.rec.runStartedAt = Date.now();
+          }
+          if (p && !p.dead && ns.Game.state === 'playing') {
+            const hp = Math.max(0, Math.min(1, p.hp / p.maxHp));
+            if (hp < S.rec.runMin) S.rec.runMin = hp;
+            S.rec.runHpSum += hp; S.rec.runHpN++;
+            let d = 400;
+            for (const e of ns.EnemyMgr.all()) {
+              if (e.dead || e.silent || e.behavior === 'thief') continue;
+              const dd = Math.hypot(e.x - p.x, e.y - p.y);
+              if (dd < d) d = dd;
+            }
+            S.rec.runDistSum += d; S.rec.runDistN++;
+          }
+        } catch (e) {}
+      }
       try {
         // 已經進場（不管是 bot 開的還是你手動開的）→ 這一輪就沿用這個組合，之後不再要求滿房
         if (ns.Room && ns.Room.room && ns.Game.state === 'playing') S.coopFull = false;
@@ -730,6 +763,8 @@
     { id: 'cfg.focus', label: '集火瞄準', cat: 'core', type: 'bool', def: true, desc: '單體優先' },
     { id: 'cfg.passiveFirst', label: '被動優先', cat: 'core', type: 'bool', def: true, desc: '被動>招式' },
     { id: 'cfg.record', label: '記錄模式', cat: 'core', type: 'bool', def: false, desc: '人類示範' },
+    { id: 'cfg.selfLearn', label: '自主學習', cat: 'core', type: 'bool', def: true, desc: 'bot 自己學' },
+    { id: 'cfg.exploreRate', label: '探索率', cat: 'brain', type: 'number', def: 0.05, min: 0, max: 0.3, step: 0.01, desc: 'epsilon-greedy 探索' },
     // --- 移動 / 戰鬥 ---
     { id: 'steer.fearLow', label: '恐懼門檻(低血)', cat: 'movement', type: 'number', def: 0.35, min: 0.15, max: 0.6, step: 0.01, humanTrackable: true, humanSource: 'learn.params.fearLow', desc: '低血量時恐懼係數切換點' },
     { id: 'steer.fearMid', label: '恐懼門檻(中血)', cat: 'movement', type: 'number', def: 0.6, min: 0.4, max: 0.8, step: 0.01, humanTrackable: true, humanSource: 'learn.params.fearMid', desc: '中血量時恐懼係數切換點' },
@@ -752,6 +787,16 @@
     { id: 'score.atkWeight', label: '攻擊卡權重', cat: 'scoring', type: 'number', def: 60, min: 0, max: 100, step: 1, desc: '攻擊卡優先度' },
     { id: 'score.cdWeight', label: '冷卻卡權重', cat: 'scoring', type: 'number', def: 55, min: 0, max: 100, step: 1, desc: '冷卻卡優先度' },
     { id: 'score.passiveFirst', label: '被動優先分數', cat: 'scoring', type: 'number', def: 400, min: 200, max: 700, step: 10, desc: '被動 vs 招式升級' },
+    // STAT_PRI 個別權重
+    { id: 'statPri.xp', label: 'XP stat 權重', cat: 'scoring', type: 'number', def: 74, min: 0, max: 100, step: 1, desc: '經驗卡優先度', humanTrackable: false },
+    { id: 'statPri.atk', label: 'ATK stat 權重', cat: 'scoring', type: 'number', def: 60, min: 0, max: 100, step: 1, desc: '攻擊卡優先度' },
+    { id: 'statPri.cd', label: 'CD stat 權重', cat: 'scoring', type: 'number', def: 55, min: 0, max: 100, step: 1, desc: '冷卻卡優先度' },
+    { id: 'statPri.def', label: 'DEF stat 權重', cat: 'scoring', type: 'number', def: 45, min: 0, max: 100, step: 1, desc: '防禦卡優先度' },
+    { id: 'statPri.hp', label: 'HP stat 權重', cat: 'scoring', type: 'number', def: 40, min: 0, max: 100, step: 1, desc: '血量卡優先度' },
+    { id: 'statPri.rgn', label: 'RGN stat 權重', cat: 'scoring', type: 'number', def: 35, min: 0, max: 100, step: 1, desc: '回血卡優先度' },
+    { id: 'statPri.mag', label: 'MAG stat 權重', cat: 'scoring', type: 'number', def: 25, min: 0, max: 100, step: 1, desc: '磁鐵卡優先度' },
+    { id: 'statPri.spd', label: 'SPD stat 權重', cat: 'scoring', type: 'number', def: 15, min: 0, max: 100, step: 1, desc: '速度卡優先度' },
+    { id: 'statPri.heal', label: 'HEAL stat 權重', cat: 'scoring', type: 'number', def: 5, min: 0, max: 100, step: 1, desc: '補血卡優先度' },
     // --- 知識圖譜超參數 ---
     { id: 'brain.emaLr', label: '學習率(EMA)', cat: 'brain', type: 'number', def: 0.15, min: 0.01, max: 0.5, step: 0.01, desc: 'Hebbian 更新速率' },
     { id: 'brain.decay', label: '衰減率', cat: 'brain', type: 'number', def: 0.85, min: 0.5, max: 0.99, step: 0.01, desc: 'EMA 舊值保留率' },
@@ -764,7 +809,7 @@
   // 取得參數當前值（依 id 路徑）
   function brainGet(id) {
     const parts = id.split('.');
-    let o = (parts[0] === 'cfg') ? cfg : (parts[0] === 'learn') ? cfg.learn : (parts[0] === 'steer') ? cfg.steer : (parts[0] === 'score') ? null : (parts[0] === 'brain') ? cfg.brain : null;
+    let o = (parts[0] === 'cfg') ? cfg : (parts[0] === 'learn') ? cfg.learn : (parts[0] === 'steer') ? cfg.steer : (parts[0] === 'score') ? null : (parts[0] === 'statPri') ? cfg.statPri : (parts[0] === 'brain') ? cfg.brain : null;
     // score 特殊：cfg 沒有 score，用 cfg.learn.params 或 cfg.steer
     if (parts[0] === 'score') {
       if (parts[1] === 'passiveFirst') return cfg.passiveFirst;
@@ -784,7 +829,7 @@
       if (parts[1] === 'cdWeight') { cfg.steer.cdWeight = v; return; }
       return;
     }
-    let o = (parts[0] === 'cfg') ? cfg : (parts[0] === 'learn') ? cfg.learn : (parts[0] === 'steer') ? cfg.steer : (parts[0] === 'brain') ? cfg.brain : null;
+    let o = (parts[0] === 'cfg') ? cfg : (parts[0] === 'learn') ? cfg.learn : (parts[0] === 'steer') ? cfg.steer : (parts[0] === 'statPri') ? cfg.statPri : (parts[0] === 'brain') ? cfg.brain : null;
     if (!o) return;
     const keys = parts.slice(1);
     for (let i = 0; i < keys.length - 1; i++) { if (o[keys[i]] == null) o[keys[i]] = {}; o = o[keys[i]]; }
@@ -859,7 +904,25 @@
       ['steer.healCardHp', 'concept:survival'], ['learn.healThr', 'concept:survival'],
       ['score.xpWeight', 'concept:xp_gain'], ['cfg.farm', 'concept:efficiency'],
       ['learn.cardStr', 'concept:efficiency'],
+      ['steer.springHp', 'concept:survival'], ['steer.magnetBase', 'concept:efficiency'],
+      ['steer.farmHpOn', 'concept:efficiency'], ['steer.farmHpOff', 'concept:safety'],
+      ['cfg.focus', 'concept:efficiency'], ['cfg.passiveFirst', 'concept:xp_gain'],
     ];
+    // 組合邊：參數交互（fearLow × retreatDist → safety 等）
+    const combos = [
+      ['steer.fearLow', 'steer.retreatDist', 'concept:safety'],
+      ['steer.fearK', 'steer.farmHpOff', 'concept:safety'],
+      ['learn.cardStr', 'score.xpWeight', 'concept:xp_gain'],
+      ['learn.bondStr', 'learn.itemStr', 'concept:efficiency'],
+      ['steer.orbHp', 'steer.healCardHp', 'concept:survival'],
+    ];
+    for (const [a, b, c] of combos) {
+      if (B.nodes[a] && B.nodes[b] && B.nodes[c]) {
+        B.edges.push({ from: a, to: c, rel: 'combo', w: 0.5, evidence: 0 });
+        B.edges.push({ from: b, to: c, rel: 'combo', w: 0.5, evidence: 0 });
+        B.edges.push({ from: a, to: b, rel: 'interacts', w: 0.4, evidence: 0 });
+      }
+    }
     for (const [a, b] of causal) {
       if (B.nodes[a] && B.nodes[b]) B.edges.push({ from: a, to: b, rel: 'influences', w: 0.6, evidence: 0 });
     }
@@ -1062,8 +1125,8 @@
   // ---------- 4. 選卡邏輯 ----------
   // 學習（經驗 ×1.12，最多 8 張 = ×2.48）越早拿越賺，排第一；磁鐵（吸取範圍 ×1.3）拿到約 260px 前也很優先，
   // 範圍大了光球會自己飛過來，不用一顆一顆跑去撿，省下來的時間都在打怪
-  const STAT_PRI = { xp: 74, atk: 60, cd: 55, def: 45, hp: 40, rgn: 35, mag: 25, spd: 15, heal: 5 };
-  const KIND_PRI = { homing: 13, nova: 12, aura: 12, orbit: 11, chain: 10, projectile: 9, boomerang: 8, beam: 8, meteor: 8, turret: 7, mine: 6, cone: 6, melee: 4, dash: 3, trail: 3 };
+  const STAT_PRI = Object.assign({ xp: 74, atk: 60, cd: 55, def: 45, hp: 40, rgn: 35, mag: 25, spd: 15, heal: 5 }, cfg.statPri || {});
+  const KIND_PRI = Object.assign({ homing: 13, nova: 12, aura: 12, orbit: 11, chain: 10, projectile: 9, boomerang: 8, beam: 8, meteor: 8, turret: 7, mine: 6, cone: 6, melee: 4, dash: 3, trail: 3 }, cfg.kindPri || {});
 
   function profileOf(ns) {
     const p = ns.Game.player;
@@ -1131,7 +1194,9 @@
       // 輸出溢出（怪一出來就被清光、場上平均不到 25 隻）：多的傷害換不到經驗，學習（經驗 ×1.12）排到招式升級前面，
       // 只輸給進化和進化要的被動
       if (id === 'xp' && S.spawnLimited) return 660;
-      const pri = id === 'def' && (p.dmgReduce || 0) < 0.69 ? 70 : id === 'mag' && (p.magnet || 78) < 260 ? 72 : (STAT_PRI[id] || 20);
+      const pri = id === 'def' && (p.dmgReduce || 0) < 0.69 ? 70 : id === 'mag' && (p.magnet || 78) < 260 ? 72 : ((cfg.statPri && cfg.statPri[id]) || STAT_PRI[id] || 20);
+      // 寫回 cfg.statPri 以便腦節點反映（學習時更新）
+      try { if (cfg.statPri) cfg.statPri[id] = STAT_PRI[id]; } catch (e) {}
       return (cfg.passiveFirst ? 500 : 300) + pri;
     }
     if (type === 'up') {
@@ -1155,6 +1220,11 @@
     let best = 0, bestS = -Infinity;
     // 記錄模式學到的偏好只微調分數（±200），不會蓋掉進化 / 配置招式這些硬規則
     cards.forEach((c, i) => { const s = scoreCard(ns, p, c) + cardBias(c.key); if (s > bestS) { bestS = s; best = i; } });
+    // 自主學習探索：偶爾隨機選卡，探索參數空間
+    if (cfg.selfLearn && cfg.on && cfg.exploreRate > 0 && Math.random() < cfg.exploreRate) {
+      best = Math.floor(Math.random() * cards.length);
+      log('explore pick', cards[best].key);
+    }
     // 沒有任何有用的卡（進化、配置招式、被動、往進化前進的升級都沒有）→ 有重抽次數就重抽
     const rr = document.getElementById('lvl-reroll');
     if (bestS < 500 && rr && !rr.classList.contains('hidden')) {
@@ -1162,6 +1232,7 @@
       return schedule(() => chooseCard(ns, S.lastOffer || cards), 300);
     }
     log('pick', cards[best].key, bestS);
+    if (cfg.selfLearn && cfg.on) { if (!S.rec.runCards.includes(cards[best].key)) S.rec.runCards.push(cards[best].key); }
     ns.RunUI.pick(best);
   }
   // ---------- 5. 羈絆 ----------
@@ -1181,10 +1252,11 @@
     if (!p || !ns.UI.isOpen('scr-bond')) return;
     const order = opt.loose.map((m, i) => ({ m, i })).sort((a, b) =>
       (bondRank(ns, p, a.m) - bondBias(a.m.id)) - (bondRank(ns, p, b.m) - bondBias(b.m.id)));
-    if (opt.mode === 'add') { log('bond add', order[0].m.id); return ns.RunUI.pickBond(order[0].i); }
+    if (opt.mode === 'add') { log('bond add', order[0].m.id); if (cfg.selfLearn && cfg.on) { if (!S.rec.runBonds.includes(order[0].m.id)) S.rec.runBonds.push(order[0].m.id); } return ns.RunUI.pickBond(order[0].i); }
     // pair：先選第一個，清單會重繪（扣掉第一個），再選第二個
     const first = order[0].m, second = order[1].m;
     log('bond pair', first.id, second.id);
+    if (cfg.selfLearn && cfg.on) { if (!S.rec.runBonds.includes(first.id)) S.rec.runBonds.push(first.id); if (!S.rec.runBonds.includes(second.id)) S.rec.runBonds.push(second.id); }
     ns.RunUI.pickBond(order[0].i);
     schedule(() => {
       const list = opt.loose.filter(m => m !== first);
