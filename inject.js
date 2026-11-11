@@ -304,7 +304,7 @@
   // ---------- 3. 主程式 ----------
   function boot(ns) {
     // 除錯用：放在 Symbol 下，不可列舉，避免 window 上的明字鍵名觸發偵測
-    try { Object.defineProperty(window, Symbol.for('psbot.debug'), { value: { ns, cfg, stats, S, learn: { exportLearn, importLearnFile, mergeLearn, resetLearn, cardBias, bondBias, itemBias, learnedMove, fearModel, healThreshold }, brain: { buildBrain, adaptBrain, exportBrain, importBrainFile, brainGet, brainSet, PARAM_REGISTRY } }, configurable: true }); } catch {}
+    try { Object.defineProperty(window, Symbol.for('psbot.debug'), { value: { ns, cfg, stats, S, steer, learn: { exportLearn, importLearnFile, mergeLearn, resetLearn, cardBias, bondBias, itemBias, learnedMove, fearModel: () => fearModel(ns), healThreshold }, brain: { buildBrain, adaptBrain, exportBrain, importBrainFile, brainGet, brainSet, PARAM_REGISTRY } }, configurable: true }); } catch {}
     log('namespace captured, version', VERSION);
     // 核心模組都認出來、DOM 也好了才 patch。其他模組晚一點就緒沒關係（用到的地方都有防護）。
     const need = ['Game', 'Input', 'RunUI', 'LevelUp', 'Moves', 'DEX_BY', 'UI', 'T'];
@@ -775,13 +775,13 @@
     return lm ? Math.max(0.25, Math.min(0.6, lm.hp * 0.6)) : base;
   }
   // 恐懼模型：人類平均血量高 / 站得遠 = 保守，門檻上移、恐懼放大；反過來就放寬
-  function fearModel() {
+  function fearModel(ns) {
     const P = cfg.learn.params;
     const lm = learnedMove();
     // 狀態條件：依當前 HP 和 boss 狀態選擇 bucket
-    const p = ns.Game.player;
+    const p = ns ? ns.Game.player : null;
     const hpPct = p ? p.hp / p.maxHp : 0.5;
-    const bucket = (hpPct < 0.4 ? 'low' : hpPct < 0.7 ? 'mid' : 'high') + (ns.Judgment && ns.Judgment.active ? '_boss' : '');
+    const bucket = (hpPct < 0.4 ? 'low' : hpPct < 0.7 ? 'mid' : 'high') + (ns && ns.Judgment && ns.Judgment.active ? '_boss' : '');
     const sp = cfg.learn.stateParams && cfg.learn.stateParams[bucket];
     let low = 0.35, mid = 0.6, k = 1;
     if (sp && sp.n >= 2) {
@@ -1964,7 +1964,7 @@
     const hpPct = p.hp / p.maxHp;
     // 血量健康時幾乎不躲小怪（超夢打得死），只躲首領 / 彈幕 / 地面預警；越殘越怕。
     // 門檻與倍率會依「記錄模式學到的人類走位」微調；沒樣本時就是原本的 0.35 / 0.6 / ×1
-    const fm = fearModel();
+    const fm = fearModel(ns);
     let fear = hpPct < fm.low ? 2.5 : hpPct < fm.mid ? 1 : 0.25;
     if (fm.k !== 1) fear *= fm.k;
     // 養怪：手上有範圍招、血量健康時，繞小圈讓怪全部擠在圈裡，範圍招一次打一整團。
@@ -2606,12 +2606,15 @@
     const open = id => { const e = document.getElementById(id); return e && !e.classList.contains('hidden'); };
     // 回主選單途中可能跳出的提示，一律按「稍後 / 關閉」
     if (open('scr-test')) { const opt = document.querySelector('#scr-test button'); if (opt) { opt.click(); return; } }
+    if (open('scr-result')) { const btn = document.querySelector('#scr-result button'); if (btn) { btn.click(); return; } }
+    if (open('scr-login')) { const guest = [...document.querySelectorAll('#scr-login button')].find(b => b.textContent.includes('訪客')); if (guest) { guest.click(); return; } }
     for (const [scr, btn] of [['scr-savenote', 'savenote-ok'], ['scr-news', 'news-close'], ['scr-nick', 'nick-later'], ['scr-recover', 'rec-later']]) {
       if (open(scr)) { document.getElementById(btn)?.click(); return; }
     }
-    if (open('scr-over')) {
-      if (now() - S.overAt > 4000 && now() - (S.againAt || 0) > 2000) { S.againAt = now(); document.getElementById('btn-again')?.click(); }
-      return;
+    if (open('scr-over') || ns.Game.state === 'over') {
+      const btn = document.getElementById('btn-again');
+      if (btn && now() - S.overAt > 4000 && now() - (S.againAt || 0) > 2000) { S.againAt = now(); btn.click(); return; }
+      if (ns.Game.state === 'over') return;
     }
     // 多人：跑完會回到房間（scr-lobby），只有房主能開下一局。
     // 遊戲自己會把 lobby-start 隱藏（訪客）或 disable（人數不足 / 有人還在連線），照它的判斷走就好。
