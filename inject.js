@@ -19,7 +19,7 @@
   try { Object.defineProperty(window, GUARD, { value: 1, configurable: true }); } catch { window[GUARD] = 1; }
 
   const STORE_KEY = 'psbot.v1';
-  const VERSION = '8.0.0';   // v8：per-Pokémon brain profiles + 回血池安全評估 + 死因追蹤 + 更多參數
+  const VERSION = '9.0.0';   // v9：死亡原因追蹤 + 狀態條件參數 + 寶可夢強弱 + 獎勵安全學習 + per-Pokémon brain
   const log = (...a) => console.log('%c[PSBot]', 'color:#ff8ad8', ...a);
   let capturedNs = null;
 
@@ -240,6 +240,16 @@
                 cardStr: null, bondStr: null, itemStr: null, locked: {} },
       // 局歷史（最近 30 局）：用來算品質趨勢與除錯
       history: [],
+      // 死亡原因追蹤：{ boss: N, mob: N, projectile: N, hazard: N, unknown: N }
+      deathCauses: { boss: 0, mob: 0, projectile: 0, hazard: 0, unknown: 0 },
+      // 獎勵安全追蹤：每次撿獎勵的結果 { safe: N, unsafe: N, died: N }
+      rewardSafety: { safe: 0, unsafe: 0, died: 0, totalHpLost: 0 },
+      // 狀態條件參數：依狀態桶儲存恐懼參數 { [bucket]: { fearLow, fearMid, fearK, n } }
+      stateParams: {},
+      // 寶可夢強弱追蹤：{ [dex]: { runs, avgTime, avgLevel, avgKills, bestTime } }
+      pokeStrength: {},
+      // per-decision eligibility traces：最近的決策序列
+      decisions: [],
       last: null,       // 最後一局 { at, time, level, kills }
       updatedAt: 0,
     },
@@ -265,6 +275,11 @@
   cfg.learn.params = Object.assign({}, DEFAULTS.learn.params, cfg.learn.params || {});
   cfg.learn.params.locked = Object.assign({}, cfg.learn.params.locked || {});
   if (!Array.isArray(cfg.learn.history)) cfg.learn.history = [];
+  if (!cfg.learn.deathCauses || typeof cfg.learn.deathCauses !== 'object') cfg.learn.deathCauses = { boss: 0, mob: 0, projectile: 0, hazard: 0, unknown: 0 };
+  if (!cfg.learn.rewardSafety || typeof cfg.learn.rewardSafety !== 'object') cfg.learn.rewardSafety = { safe: 0, unsafe: 0, died: 0, totalHpLost: 0 };
+  if (!cfg.learn.stateParams || typeof cfg.learn.stateParams !== 'object') cfg.learn.stateParams = {};
+  if (!cfg.learn.pokeStrength || typeof cfg.learn.pokeStrength !== 'object') cfg.learn.pokeStrength = {};
+  if (!Array.isArray(cfg.learn.decisions)) cfg.learn.decisions = [];
   cfg.steer = Object.assign({}, DEFAULTS.steer, cfg.steer || {});
   cfg.brain = Object.assign({ v: 1, nodes: {}, edges: [], updatedAt: 0 }, cfg.brain || {});
   if (!cfg.brain.nodes || typeof cfg.brain.nodes !== 'object') cfg.brain.nodes = {};
@@ -598,6 +613,41 @@
     const t = performance.now();
     if (t - (S.rec.saveAt || 0) > 5000) { S.rec.saveAt = t; save(); }
   }
+  // 死亡原因偵測：分析死亡時的遊戲狀態
+  function detectDeathCause(ns, d) {
+    if (!d.dead) return 'survived';
+    try {
+      const p = ns.Game.player;
+      const judging = !!(ns.Judgment && ns.Judgment.active);
+      // 檢查周圍敵人
+      let nearBoss = false, nearMob = false, nearProjectile = false;
+      for (const e of ns.EnemyMgr.all()) {
+        if (e.dead) continue;
+        const dd = Math.hypot(e.x - p.x, e.y - p.y);
+        if (dd < 100) {
+          if (e.boss || e.arceus) nearBoss = true;
+          else nearMob = true;
+        }
+      }
+      // 檢查是否有地面預警/彈幕
+      // (簡化：如果 HP 非常低且周圍有 boss → boss kill)
+      if (nearBoss) return 'boss';
+      if (nearMob) return 'mob';
+      // 檢查是否在審判中
+      if (judging) return 'projectile';
+      // 檢查 HP 是否極低（可能被彈幕/地面預警擊殺）
+      if (p && p.hp <= 0) {
+        // 如果周圍沒有敵人，可能是遠程攻擊
+        let anyNear = false;
+        for (const e of ns.EnemyMgr.all()) {
+          if (!e.dead && Math.hypot(e.x - p.x, e.y - p.y) < 200) { anyNear = true; break; }
+        }
+        if (!anyNear) return 'projectile';
+      }
+      return 'unknown';
+    } catch (e) { return 'unknown'; }
+  }
+
   // 局品質：存活時間（秒）為主，加上等級/擊倒加權；正規化到 0~1（以 300 秒為滿分）
   function runQuality(d) {
     const t = Math.max(0, Math.min(300, d.time || 0));
@@ -612,7 +662,31 @@
     // 本局平均走位
     const avgHp = S.rec.runHpN > 0 ? S.rec.runHpSum / S.rec.runHpN : null;
     const avgDist = S.rec.runDistN > 0 ? S.rec.runDistSum / S.rec.runDistN : null;
+    const deathCause = detectDeathCause(ns, d);
     L.runs++;
+    // 死亡原因追蹤
+    if (d.dead && L.deathCauses) {
+      const c = deathCause in L.deathCauses ? deathCause : 'unknown';
+      L.deathCauses[c] = (L.deathCauses[c] || 0) + 1;
+    }
+    // 獎勵安全追蹤：minHp 低表示冒險撿獎勵
+    if (L.rewardSafety) {
+      if (S.rec.runMin != null && S.rec.runMin < 0.2) L.rewardSafety.unsafe++;
+      else L.rewardSafety.safe++;
+      if (d.dead) L.rewardSafety.died++;
+      L.rewardSafety.totalHpLost += (1 - (S.rec.runMin || 1));
+    }
+    // 寶可夢強弱追蹤
+    const dex = S.rec.dex || (ns.Game.player && ns.Game.player.dex);
+    if (dex != null) {
+      if (!L.pokeStrength[dex]) L.pokeStrength[dex] = { runs: 0, avgTime: 0, avgLevel: 0, avgKills: 0, bestTime: 0 };
+      const ps = L.pokeStrength[dex];
+      ps.runs++;
+      ps.avgTime = ps.avgTime * 0.8 + (d.time || 0) * 0.2;
+      ps.avgLevel = ps.avgLevel * 0.8 + (d.level || 0) * 0.2;
+      ps.avgKills = ps.avgKills * 0.8 + (d.kills || 0) * 0.2;
+      if ((d.time || 0) > ps.bestTime) ps.bestTime = d.time || 0;
+    }
     if (S.rec.runMin != null) {
       const M = L.move;
       M.min = M.min == null ? S.rec.runMin : M.min * 0.7 + S.rec.runMin * 0.3;
@@ -629,6 +703,19 @@
     for (const k of S.rec.runCards) updateVal('cards', k);
     for (const k of S.rec.runBonds) updateVal('bonds', k);
     for (const k of S.rec.runItems) updateVal('items', k);
+    // 狀態條件參數：依狀態桶儲存恐懼參數
+    const stateBucket = (avgHp != null) ? (avgHp < 0.4 ? 'low' : avgHp < 0.7 ? 'mid' : 'high') + (ns.Judgment && ns.Judgment.active ? '_boss' : '') : null;
+    if (stateBucket && avgHp != null && q > 0.3) {
+      if (!L.stateParams[stateBucket]) L.stateParams[stateBucket] = { fearLow: null, fearMid: null, fearK: null, n: 0 };
+      const sp = L.stateParams[stateBucket];
+      const targetLow = Math.max(0.2, Math.min(0.5, avgHp * 0.55));
+      const targetMid = Math.max(0.45, Math.min(0.75, avgHp * 0.9));
+      const targetK = Math.max(0.7, Math.min(1.4, 0.9 + ((avgDist || 140) - 140) / 400));
+      sp.fearLow = sp.fearLow == null ? targetLow : sp.fearLow * 0.85 + targetLow * 0.15;
+      sp.fearMid = sp.fearMid == null ? targetMid : sp.fearMid * 0.85 + targetMid * 0.15;
+      sp.fearK = sp.fearK == null ? targetK : sp.fearK * 0.85 + targetK * 0.15;
+      sp.n++;
+    }
     // outcome-aware：走位參數 EMA（品質加權：品質高才更新，避免學壞習慣）
     if (avgHp != null && q > 0.3) {
       const P = L.params;
@@ -670,31 +757,45 @@
     return { hp: M.hp / M.n, dist: Math.min(400, M.dist / M.n), min: M.min };
   }
   // 補血卡門檻：優先用 outcome-aware 參數；其次看你選補血卡時的血量；再來是你平常的血量
+  // 死亡原因影響：如果經常被 mob 殺死，降低補血門檻
   function healThreshold() {
+    const L = cfg.learn;
+    let base = 0.35;
+    if (L && L.deathCauses) {
+      const total = Object.values(L.deathCauses).reduce((a, b) => a + b, 0);
+      if (total > 0 && (L.deathCauses.mob || 0) / total > 0.5) base = 0.25; // 經常被 mob 殺，更早補血
+      if (total > 0 && (L.deathCauses.boss || 0) / total > 0.5) base = 0.4;  // 經常被 boss 殺，稍微更早補血
+    }
     const P = cfg.learn.params;
     if (P && typeof P.healThr === 'number' && isFinite(P.healThr) && !(P.locked && P.locked.healThr)) return P.healThr;
     if (P && typeof P.healThr === 'number' && isFinite(P.healThr)) return P.healThr;
     const H = cfg.learn.heal;
     if (H && (H.n | 0) >= 2) return Math.max(0.25, Math.min(0.6, H.hp / H.n + 0.05));
     const lm = learnedMove();
-    return lm ? Math.max(0.25, Math.min(0.5, lm.hp * 0.6)) : 0.35;
+    return lm ? Math.max(0.25, Math.min(0.6, lm.hp * 0.6)) : base;
   }
   // 恐懼模型：人類平均血量高 / 站得遠 = 保守，門檻上移、恐懼放大；反過來就放寬
   function fearModel() {
     const P = cfg.learn.params;
-    const useP = P && (P.fearLow != null || P.fearMid != null || P.fearK != null);
     const lm = learnedMove();
-    if (!lm && !useP) return { low: 0.35, mid: 0.6, k: 1 };
+    // 狀態條件：依當前 HP 和 boss 狀態選擇 bucket
+    const p = ns.Game.player;
+    const hpPct = p ? p.hp / p.maxHp : 0.5;
+    const bucket = (hpPct < 0.4 ? 'low' : hpPct < 0.7 ? 'mid' : 'high') + (ns.Judgment && ns.Judgment.active ? '_boss' : '');
+    const sp = cfg.learn.stateParams && cfg.learn.stateParams[bucket];
     let low = 0.35, mid = 0.6, k = 1;
-    if (lm) {
+    if (sp && sp.n >= 2) {
+      if (typeof sp.fearLow === 'number') low = sp.fearLow;
+      if (typeof sp.fearMid === 'number') mid = sp.fearMid;
+      if (typeof sp.fearK === 'number') k = sp.fearK;
+    } else if (lm) {
       const shift = Math.max(-0.12, Math.min(0.12, (lm.hp - 0.65) * 0.4));
       low = 0.35 + shift; mid = 0.6 + shift;
       k = Math.max(0.7, Math.min(1.4, 0.9 + (lm.dist - 140) / 400 + (lm.hp - 0.65) * 0.8));
     }
     // outcome-aware 參數覆寫（若已學到且未鎖定）
     if (P) {
-      if (typeof P.fearLow === 'number' && isFinite(P.fearLow) && !(P.locked && P.locked.fearLow)) low = P.fearLow;
-      else if (typeof P.fearLow === 'number' && isFinite(P.fearLow)) low = P.fearLow;
+      if (typeof P.fearLow === 'number' && isFinite(P.fearLow)) low = P.fearLow;
       if (typeof P.fearMid === 'number' && isFinite(P.fearMid)) mid = P.fearMid;
       if (typeof P.fearK === 'number' && isFinite(P.fearK)) k = P.fearK;
     }
@@ -837,6 +938,9 @@
     { id: 'portal.riskTolerance', label: '風險容忍度', cat: 'portal', type: 'number', def: 0.5, min: 0, max: 1, step: 0.05, desc: '高風險高回報決策閾值' },
     { id: 'portal.rewardThreshold', label: '獎勵門檻', cat: 'portal', type: 'number', def: 1.5, min: 0.5, max: 5, step: 0.1, desc: '預期獎勵超過此值才冒險' },
     { id: 'portal.lateGameBonus', label: '後期加成', cat: 'portal', type: 'number', def: 2.0, min: 1, max: 5, step: 0.1, desc: '後期（>20min）進入傳送門的回報加成' },
+    // 死亡/獎勵學習參數
+    { id: 'surv.deathBossPenalty', label: 'BOSS死亡懲罰', cat: 'survival', type: 'number', def: 0.5, min: 0, max: 1, step: 0.1, desc: '被BOSS殺死時的學習懲罰' },
+    { id: 'surv.deathMobPenalty', label: '小怪死亡懲罰', cat: 'survival', type: 'number', def: 0.3, min: 0, max: 1, step: 0.1, desc: '被小怪殺死時的學習懲罰' },
     // --- 移動 / 戰鬥 ---
     { id: 'steer.fearLow', label: '恐懼門檻(低血)', cat: 'movement', type: 'number', def: 0.35, min: 0.15, max: 0.6, step: 0.01, humanTrackable: true, humanSource: 'learn.params.fearLow', desc: '低血量時恐懼係數切換點' },
     { id: 'steer.fearMid', label: '恐懼門檻(中血)', cat: 'movement', type: 'number', def: 0.6, min: 0.4, max: 0.8, step: 0.01, humanTrackable: true, humanSource: 'learn.params.fearMid', desc: '中血量時恐懼係數切換點' },
@@ -2811,6 +2915,27 @@
       const lines = [];
       const curDex = (S.rec && S.rec.dex) || (ns.Game.player && ns.Game.player.dex) || '?';
       lines.push(`當前寶可夢 dex=${curDex} · 已存 ${Object.keys(cfg.brains||{}).length} 隻的腦 · 節點 ${nodes.length} · 邊 ${ (B.edges||[]).length }`);
+      // 死亡原因統計
+      const dc = cfg.learn.deathCauses || {};
+      const dcTotal = Object.values(dc).reduce((a, b) => a + b, 0);
+      if (dcTotal > 0) {
+        lines.push(`死亡原因: boss=${dc.boss||0} mob=${dc.mob||0} proj=${dc.projectile||0} hazard=${dc.hazard||0} unknown=${dc.unknown||0}`);
+      }
+      // 寶可夢強弱
+      const ps = cfg.learn.pokeStrength || {};
+      const psKeys = Object.keys(ps);
+      if (psKeys.length > 0) {
+        lines.push('寶可夢強弱:');
+        for (const dex of psKeys) {
+          const p = ps[dex];
+          lines.push(`  dex=${dex}: ${p.runs}局 avgTime=${Math.round(p.avgTime)}s avgLv=${p.avgLevel.toFixed(1)} best=${Math.round(p.bestTime)}s`);
+        }
+      }
+      // 獎勵安全
+      const rs = cfg.learn.rewardSafety || {};
+      if ((rs.safe||0)+(rs.unsafe||0) > 0) {
+        lines.push(`獎勵安全: safe=${rs.safe||0} unsafe=${rs.unsafe||0} died=${rs.died||0}`);
+      }
       for (const cat of BRAIN_CATS) {
         const ns = groups[cat];
         if (!ns || !ns.length) continue;
