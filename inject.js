@@ -19,7 +19,7 @@
   try { Object.defineProperty(window, GUARD, { value: 1, configurable: true }); } catch { window[GUARD] = 1; }
 
   const STORE_KEY = 'psbot.v1';
-  const VERSION = '9.0.0';   // v9：死亡原因追蹤 + 狀態條件參數 + 寶可夢強弱 + 獎勵安全學習 + per-Pokémon brain
+  const VERSION = '9.0.1';   // v9.0.1：修正 fearModel(ns) 未定義導致 bot 不走路；新增登入/測驗/結果畫面自動處理
   const log = (...a) => console.log('%c[PSBot]', 'color:#ff8ad8', ...a);
   let capturedNs = null;
 

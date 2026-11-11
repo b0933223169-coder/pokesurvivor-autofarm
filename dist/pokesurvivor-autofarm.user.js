@@ -2,7 +2,7 @@
 // @name         PokéSurvivor 自動掛機 (PSBot)
 // @name:en      PokéSurvivor Auto-Farm (PSBot)
 // @namespace    https://github.com/b0933223169-coder/pokesurvivor-autofarm
-// @version      9.0.0
+// @version      9.0.1
 // @description  PokéSurvivor 自動走位躲招、選卡、綁羈絆、進神祕裂縫、處理事件（Gholdengo、求救、祭壇…）、自動再開一局
 // @description:en Auto movement & dodging, card picks, bonds, rifts, events (Gholdengo, rescues, altars…) and auto restart for PokéSurvivor
 // @author       BoundlessEgret
@@ -39,7 +39,7 @@
   try { Object.defineProperty(window, GUARD, { value: 1, configurable: true }); } catch { window[GUARD] = 1; }
 
   const STORE_KEY = 'psbot.v1';
-  const VERSION = '9.0.0';   // v9：死亡原因追蹤 + 狀態條件參數 + 寶可夢強弱 + 獎勵安全學習 + per-Pokémon brain
+  const VERSION = '9.0.1';   // v9.0.1：修正 fearModel(ns) 未定義導致 bot 不走路；新增登入/測驗/結果畫面自動處理
   const log = (...a) => console.log('%c[PSBot]', 'color:#ff8ad8', ...a);
   let capturedNs = null;
 
