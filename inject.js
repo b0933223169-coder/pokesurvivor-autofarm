@@ -19,7 +19,7 @@
   try { Object.defineProperty(window, GUARD, { value: 1, configurable: true }); } catch { window[GUARD] = 1; }
 
   const STORE_KEY = 'psbot.v1';
-  const VERSION = '9.0.1';   // v9.0.1：修正 fearModel(ns) 未定義導致 bot 不走路；新增登入/測驗/結果畫面自動處理
+  const VERSION = '4.1.0';   // v4.1：真正的參數強化學習（SPSA）+ 飛行記錄器 + 撿寶風險表 + 傳說先進先出佇列
   const log = (...a) => console.log('%c[PSBot]', 'color:#ff8ad8', ...a);
   let capturedNs = null;
 
@@ -210,17 +210,13 @@
     },
     // 知識圖譜（腦）：所有參數都是節點，關係是邊
     brain: { v: 1, nodes: {}, edges: [], updatedAt: 0 },
-    // 每隻寶可夢的腦（per-Pokémon brain profiles）
-    brains: {},   // { [dex]: brain }
-    // 生存 / 獎勵 / BOSS 參數
-    surv: { healUrgent: 0.25, orbDanger: 0.4, retreatBoss: 330, rewardSafeHp: 0.5, rewardSafeDist: 200 },
-    boss: { prioritizeLowHp: true, prioritizeHighDmg: true, arceusFocus: false },
-    reward: { coinPriority: 2, xpPriority: 1, ticketPriority: 9 },
-    // 傳送門 / 風險決策參數
-    portal: { enterHp: 0.7, enterDist: 300, riskTolerance: 0.5, rewardThreshold: 1.5, lateGameBonus: 2.0 },
     // AI 自主學習：bot 自己打時也記錄並更新腦（不只學人類）
     selfLearn: true,
     exploreRate: 0.05,
+    // 強化學習 v2：參數搜尋 + 死因記錄 + 撿寶風險 + 傳說佇列（詳見 RL 區塊）
+    rl: { on: true, bossQueue: true, sigma: 0.12, lr: 0.5, w: { surv: 1, jt: 1.5, jb: 0.5, lv: 0.15, kl: 0.1 },
+          theta: {}, cur: null, eps: null, phase: 0, cycle: 0, runs: 0, sPlus: null, active: false, curPhase: 0, lastZ: null, lastAdv: null,
+          scores: [], log: [], centers: [], deaths: [], risk: {}, agg: {}, best: null, reverts: 0 },
     // 選卡評分權重（原 STAT_PRI / KIND_PRI，現在可調 / 可學習）
     statPri: { xp: 74, atk: 60, cd: 55, def: 45, hp: 40, rgn: 35, mag: 25, spd: 15, heal: 5 },
     kindPri: { homing: 13, nova: 12, aura: 12, orbit: 11, chain: 10, projectile: 9, boomerang: 8, beam: 8, meteor: 8, turret: 7, mine: 6, cone: 6, melee: 4, dash: 3, trail: 3 },
@@ -240,16 +236,6 @@
                 cardStr: null, bondStr: null, itemStr: null, locked: {} },
       // 局歷史（最近 30 局）：用來算品質趨勢與除錯
       history: [],
-      // 死亡原因追蹤：{ boss: N, mob: N, projectile: N, hazard: N, unknown: N }
-      deathCauses: { boss: 0, mob: 0, projectile: 0, hazard: 0, unknown: 0 },
-      // 獎勵安全追蹤：每次撿獎勵的結果 { safe: N, unsafe: N, died: N }
-      rewardSafety: { safe: 0, unsafe: 0, died: 0, totalHpLost: 0 },
-      // 狀態條件參數：依狀態桶儲存恐懼參數 { [bucket]: { fearLow, fearMid, fearK, n } }
-      stateParams: {},
-      // 寶可夢強弱追蹤：{ [dex]: { runs, avgTime, avgLevel, avgKills, bestTime } }
-      pokeStrength: {},
-      // per-decision eligibility traces：最近的決策序列
-      decisions: [],
       last: null,       // 最後一局 { at, time, level, kills }
       updatedAt: 0,
     },
@@ -275,23 +261,14 @@
   cfg.learn.params = Object.assign({}, DEFAULTS.learn.params, cfg.learn.params || {});
   cfg.learn.params.locked = Object.assign({}, cfg.learn.params.locked || {});
   if (!Array.isArray(cfg.learn.history)) cfg.learn.history = [];
-  if (!cfg.learn.deathCauses || typeof cfg.learn.deathCauses !== 'object') cfg.learn.deathCauses = { boss: 0, mob: 0, projectile: 0, hazard: 0, unknown: 0 };
-  if (!cfg.learn.rewardSafety || typeof cfg.learn.rewardSafety !== 'object') cfg.learn.rewardSafety = { safe: 0, unsafe: 0, died: 0, totalHpLost: 0 };
-  if (!cfg.learn.stateParams || typeof cfg.learn.stateParams !== 'object') cfg.learn.stateParams = {};
-  if (!cfg.learn.pokeStrength || typeof cfg.learn.pokeStrength !== 'object') cfg.learn.pokeStrength = {};
-  if (!Array.isArray(cfg.learn.decisions)) cfg.learn.decisions = [];
   cfg.steer = Object.assign({}, DEFAULTS.steer, cfg.steer || {});
   cfg.brain = Object.assign({ v: 1, nodes: {}, edges: [], updatedAt: 0 }, cfg.brain || {});
   if (!cfg.brain.nodes || typeof cfg.brain.nodes !== 'object') cfg.brain.nodes = {};
   if (!Array.isArray(cfg.brain.edges)) cfg.brain.edges = [];
-  if (!cfg.brains || typeof cfg.brains !== 'object') cfg.brains = {};
   cfg.selfLearn = (cfg.selfLearn !== undefined) ? !!cfg.selfLearn : true;
+  cfg.rl = Object.assign(JSON.parse(JSON.stringify(DEFAULTS.rl)), cfg.rl || {});
   cfg.statPri = Object.assign({}, DEFAULTS.statPri, cfg.statPri || {});
   cfg.kindPri = Object.assign({}, DEFAULTS.kindPri, cfg.kindPri || {});
-  cfg.surv = Object.assign({}, DEFAULTS.surv, cfg.surv || {});
-  cfg.boss = Object.assign({}, DEFAULTS.boss, cfg.boss || {});
-  cfg.reward = Object.assign({}, DEFAULTS.reward, cfg.reward || {});
-  cfg.portal = Object.assign({}, DEFAULTS.portal, cfg.portal || {});
   // 舊版內建的妙蛙種子 / 蓋歐卡配置不符合「開局招式 → 變硬 → 劍舞 / 詭計 → 範圍攻擊」，存檔裡還是原樣的就刪掉，改走自動模式
   for (const [dex, old] of Object.entries({ 1: 'energy-ball,nasty-plot,leaf-storm,giga-drain', 382: 'bubble,nasty-plot,aqua-ring,hydro-pump' }))
     if (cfg.profiles[dex] && (cfg.profiles[dex].moves || []).join() === old) delete cfg.profiles[dex];
@@ -301,10 +278,402 @@
 
   const stats = { runs: 0, kills: 0, coins: 0, best: 0, startedAt: Date.now() };
 
+  // @@RL-BEGIN
+  // ======================================================================================
+  // 強化學習 v2（取代舊的「腦」裝飾層；舊 brain 不影響任何行為）
+  //
+  // 1) 參數搜尋（SPSA / 對偶擾動 + 基準局）：17 個「真的會被走位 / 選卡 / 用寶珠讀取」的參數
+  //    排程：基準局(θ) → 正擾動(θ+ε) → 負擾動(θ−ε)，三局一輪；兩個擾動局的成績差決定 θ 往哪邊走。
+  //    基準局的成績序列就是「學習曲線」，可以直接看有沒有進步。退化時自動回到歷史最佳 θ。
+  // 2) 成績不封頂：存活 + 審判存活 + 傳說擊倒 + 等級 + 擊倒；再對近 30 局做 z 標準化（優勢值）
+  // 3) 飛行記錄器：每 100ms 取樣；掉血當下歸因（地面預警 / 阿爾宙斯 / 傳說碰撞 / 彈幕 / 小怪）
+  // 4) 撿寶風險表：撿寶前的情境（血量 × 怪數 × 距離 × 審判 × 有無 Boss）→ 實際掉血 / 死亡率，回饋進撿寶評分
+  // 5) 傳說佇列：審判中照出現順序「先打完第一隻再打第二隻」，看不到 / 打不動才暫時換
+  // 6) 命中稽核：集火目標有沒有真的掉血、換了幾次目標、傳說生了幾隻 / 打倒幾隻
+  // ======================================================================================
+  const RL_SPEC = [
+    { id: 'fearLow',    lo: 0.20, hi: 0.60, def: 0.35, tip: '低血恐懼門檻' },
+    { id: 'fearMid',    lo: 0.40, hi: 0.85, def: 0.60, tip: '中血恐懼門檻' },
+    { id: 'fearK',      lo: 0.50, hi: 1.80, def: 1.00, tip: '恐懼倍率' },
+    { id: 'healThr',    lo: 0.20, hi: 0.70, def: 0.35, tip: '補血卡門檻' },
+    { id: 'springHp',   lo: 0.30, hi: 0.90, def: 0.60, tip: '補血泉觸發血量' },
+    { id: 'farmHpOn',   lo: 0.45, hi: 0.90, def: 0.65, tip: '養怪開啟血量' },
+    { id: 'farmHpOff',  lo: 0.25, hi: 0.65, def: 0.45, tip: '養怪關閉血量' },
+    { id: 'orbCrowdK',  lo: 0.10, hi: 1.20, def: 0.35, tip: '撿寶：怪群懲罰' },
+    { id: 'orbDistK',   lo: 60,   hi: 240,  def: 120,  tip: '撿寶：距離常數' },
+    { id: 'orbRiskK',   lo: 0,    hi: 12,   def: 3,    tip: '撿寶：學到的風險權重' },
+    { id: 'dmgW',       lo: 0.5,  hi: 2.0,  def: 1.0,  tip: '閃避：扣血成本倍率' },
+    { id: 'bossReach',  lo: 50,   hi: 160,  def: 90,   tip: '首領危險半徑' },
+    { id: 'arcReach',   lo: 90,   hi: 240,  def: 140,  tip: '阿爾宙斯危險半徑' },
+    { id: 'jBreakHp',   lo: 0.30, hi: 0.80, def: 0.50, tip: '審判突圍所需血量' },
+    { id: 'jBreakEdge', lo: 60,   hi: 200,  def: 110,  tip: '審判突圍：離邊緣距離' },
+    { id: 'orbUseHp',   lo: 0.20, hi: 0.60, def: 0.40, tip: '用寶珠血量' },
+    { id: 'orbAround',  lo: 4,    hi: 14,   def: 8,    tip: '用寶珠：貼身怪數' },
+  ];
+  const RL_BY = {}; for (const s of RL_SPEC) RL_BY[s.id] = s;
+  const clamp01 = x => Math.max(0, Math.min(1, x));
+  const rlMean = a => a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0;
+  const rlStd = a => { if (a.length < 2) return 0; const m = rlMean(a); return Math.sqrt(a.reduce((s, x) => s + (x - m) * (x - m), 0) / (a.length - 1)); };
+  const rlGauss = () => { let u = 0, v = 0; while (!u) u = Math.random(); while (!v) v = Math.random(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); };
+
+  function rlEnsure() {
+    const R = cfg.rl;
+    R.theta = R.theta || {};
+    const hp = (cfg.learn && cfg.learn.params) || {};   // 記錄模式學到的人類參數當起點
+    for (const s of RL_SPEC) {
+      if (typeof R.theta[s.id] !== 'number' || !isFinite(R.theta[s.id])) {
+        const hv = (s.id === 'fearLow' || s.id === 'fearMid' || s.id === 'fearK' || s.id === 'healThr') && typeof hp[s.id] === 'number' ? hp[s.id] : s.def;
+        R.theta[s.id] = clamp01((hv - s.lo) / (s.hi - s.lo));
+      }
+    }
+    for (const k of ['scores', 'log', 'centers', 'deaths']) if (!Array.isArray(R[k])) R[k] = [];
+    for (const k of ['risk', 'agg']) if (!R[k] || typeof R[k] !== 'object') R[k] = {};
+    if (!R.w) R.w = { surv: 1, jt: 1.5, jb: 0.5, lv: 0.15, kl: 0.1 };
+    return R;
+  }
+  function rlDecode(u) {
+    const o = {};
+    for (const s of RL_SPEC) o[s.id] = s.lo + clamp01(u[s.id]) * (s.hi - s.lo);
+    if (o.fearMid < o.fearLow + 0.1) o.fearMid = Math.min(RL_BY.fearMid.hi, o.fearLow + 0.1);
+    if (o.farmHpOn < o.farmHpOff + 0.1) o.farmHpOn = Math.min(RL_BY.farmHpOn.hi, o.farmHpOff + 0.1);
+    o.orbAround = Math.round(o.orbAround);
+    return o;
+  }
+  // 現在這一局用的參數值；RL 沒開 / 記錄模式時回傳原本程式裡的寫死值（fallback）
+  function rlp(id, fallback) {
+    const R = cfg.rl;
+    if (R && R.on && R.cur && !cfg.record && typeof R.cur[id] === 'number') return R.cur[id];
+    return fallback !== undefined ? fallback : (RL_BY[id] ? RL_BY[id].def : undefined);
+  }
+
+  // ---- 成績 ----
+  function rlScore(d) {
+    const w = cfg.rl.w, j = d && d.judge;
+    const surv = Math.min(Math.max(0, (d && d.time) || 0), 1800) / 1800;          // 撐到第 30 分鐘 = 1
+    const jt = j ? Math.min(j.time || 0, 900) / 900 : 0;                            // 審判裡又撐了多久
+    const jb = j ? Math.min(j.bosses || 0, 40) / 40 : 0;                            // 審判裡打倒幾隻傳說
+    const lv = Math.min((d && d.level) || 0, 100) / 100;
+    const kl = Math.log10(1 + Math.max(0, (d && d.kills) || 0)) / 4;
+    return w.surv * surv + w.jt * jt + w.jb * jb + w.lv * lv + w.kl * kl;
+  }
+  function rlBaseline() {
+    const a = cfg.rl.scores.slice(-30);
+    return { mean: rlMean(a), sd: a.length >= 4 ? Math.max(0.08, rlStd(a)) : 0.25, n: a.length };
+  }
+
+  // ---- 一局開始 / 結束 ----
+  function rlBeginRun(resume) {
+    const R = rlEnsure();
+    if (!R.on || !cfg.on || cfg.record) { R.cur = null; R.active = false; return; }
+    if (resume && R.active && R.cur) return;   // 重新整理頁面：沿用這局的參數
+    if (R.phase === 0) { R.eps = null; R.cur = rlDecode(R.theta); }
+    else {
+      if (R.phase === 1 || !R.eps) { R.eps = {}; for (const s of RL_SPEC) R.eps[s.id] = rlGauss() * (R.sigma != null ? R.sigma : 0.12); }
+      const sg = R.phase === 1 ? 1 : -1, u = {};
+      for (const s of RL_SPEC) u[s.id] = clamp01(R.theta[s.id] + sg * R.eps[s.id]);
+      R.cur = rlDecode(u);
+    }
+    R.curPhase = R.phase; R.active = true;
+    save();
+  }
+  function rlEndRun(d, botFrac) {
+    const R = rlEnsure();
+    const score = rlScore(d), base = rlBaseline();
+    R.lastZ = Math.max(-2.5, Math.min(2.5, (score - base.mean) / base.sd));
+    R.scores.push(score); if (R.scores.length > 60) R.scores = R.scores.slice(-60);
+    if (!R.active || !R.cur || botFrac < 0.9) { R.active = false; R.cur = null; save(); return { used: false, score }; }
+    R.runs = (R.runs || 0) + 1;
+    R.log.push({ n: R.runs, ph: R.curPhase, score: +score.toFixed(4), t: Math.round(d.time || 0), z: +R.lastZ.toFixed(2) });
+    if (R.log.length > 200) R.log = R.log.slice(-200);
+    const ph = R.curPhase;
+    if (ph === 0) {
+      R.centers.push(score); if (R.centers.length > 40) R.centers = R.centers.slice(-40);
+      const k = R.guardK || 4, gz = R.guardZ != null ? R.guardZ : 1.5;
+      if (R.centers.length >= k) {
+        const avg = rlMean(R.centers.slice(-k));
+        if (!R.best || avg > R.best.mean) R.best = { theta: Object.assign({}, R.theta), mean: avg, at: R.runs };
+        else if (R.centers.length >= 2 * k && avg < R.best.mean - gz * base.sd / Math.sqrt(k)) {   // 退化保護：基準局明顯比歷史最佳差才回退
+          R.theta = Object.assign({}, R.best.theta); R.centers = []; R.reverts = (R.reverts || 0) + 1; R.phase = 0;
+          log('RL: regression guard, reverting to best theta'); R.active = false; R.cur = null; save(); return { used: true, score, reverted: true };
+        }
+      }
+      R.phase = 1;
+    } else if (ph === 1) { R.sPlus = score; R.phase = 2; }
+    else {
+      const adv = Math.max(-1, Math.min(1, ((R.sPlus || 0) - score) / (2 * base.sd)));   // 正擾動較好 → 往 +ε 走
+      for (const s of RL_SPEC) R.theta[s.id] = clamp01(R.theta[s.id] + (R.lr != null ? R.lr : 0.5) * adv * R.eps[s.id]);
+      R.cycle = (R.cycle || 0) + 1; R.phase = 0; R.lastAdv = adv;
+    }
+    R.active = false; R.cur = null; save();
+    return { used: true, score };
+  }
+
+  // ---- 傳說佇列（純函式）----
+  // cands: [{ id, seenAt, visible, hp }]；st: 跨幀狀態。回傳要打的那隻（最早出現、打得到的）
+  function bossPick(cands, st, t, o) {
+    o = Object.assign({ sightMs: 1500, noDmgMs: 5000, skipMs: 4000 }, o || {});
+    st.skip = st.skip || {}; st.m = st.m || {};
+    const ids = new Set(cands.map(c => String(c.id)));
+    for (const k of Object.keys(st.m)) if (!ids.has(k)) delete st.m[k];
+    const ordered = cands.slice().sort((a, b) => a.seenAt - b.seenAt || String(a.id).localeCompare(String(b.id)));
+    for (const c of ordered) {
+      const key = String(c.id);
+      if ((st.skip[key] || 0) > t) continue;
+      const m = st.m[key] || (st.m[key] = { blockedAt: null, lastHp: c.hp, lastDmgAt: t });
+      if (c.hp < m.lastHp - 1e-9) m.lastDmgAt = t;
+      m.lastHp = c.hp;
+      if (!c.visible) {   // 暫時打不到（被樹 / 石頭擋）：先打下一隻，超過寬限就先略過這隻
+        if (m.blockedAt == null) m.blockedAt = t;
+        if (t - m.blockedAt > o.sightMs) { st.skip[key] = t + o.skipMs; m.blockedAt = null; }
+        continue;
+      }
+      m.blockedAt = null;
+      if (st.id === key) {
+        if (t - m.lastDmgAt > o.noDmgMs) { st.skip[key] = t + o.skipMs; m.lastDmgAt = t; st.rot = (st.rot || 0) + 1; continue; }   // 一直打不動：輪替
+      } else { st.id = key; m.lastDmgAt = t; st.switches = (st.switches || 0) + 1; }
+      return c;
+    }
+    return null;
+  }
+
+  // ---- 掉血歸因（純函式）----
+  // ctx: { p:{x,y,r}, enemies:[{x,y,r,boss,arceus}], shots:[{x,y,r}], hazards:[{kind}] (已確定踩到的) }
+  function attributeHit(ctx) {
+    const p = Object.assign({ r: 10 }, ctx.p); let best = null, bs = 0;
+    const put = (cause, s) => { if (s > bs) { bs = s; best = cause; } };
+    for (const h of ctx.hazards || []) put('地面預警/技能(' + (h.kind || 'zone') + ')', 3);
+    for (const e of ctx.enemies || []) {
+      const d = Math.hypot(e.x - p.x, e.y - p.y) - (e.r || 10) - p.r;
+      if (e.arceus) { if (d < 45) put('阿爾宙斯碰撞', 2.6 - d / 100); }
+      else if (e.boss) { if (d < 16) put('傳說/首領碰撞', 2.0 - d / 100); }
+      else if (d < 12) put('小怪碰撞', 1.0 - d / 100);
+    }
+    for (const s of ctx.shots || []) { const d = Math.hypot(s.x - p.x, s.y - p.y) - (s.r || 6) - p.r; if (d < 16) put('敵方彈幕', 1.6 - d / 100); }
+    return best || '未知(持續傷害/地形)';
+  }
+
+  // ---- 撿寶風險表 ----
+  const RISK = { cur: null };
+  function riskKey(hpF, crowd, d, judging, bossNear) {
+    return '' + (hpF < 0.35 ? 0 : hpF < 0.65 ? 1 : 2) + (crowd === 0 ? 0 : crowd < 4 ? 1 : 2) + (d < 200 ? 0 : d < 400 ? 1 : 2) + (judging ? 1 : 0) + (bossNear ? 1 : 0);
+  }
+  function riskPenalty(key) {
+    const c = cfg.rl.risk && cfg.rl.risk[key];
+    if (!c || c.n < 6) return 0;
+    return Math.max(0, Math.min(0.9, c.dmg * rlp('orbRiskK', 3) + c.die * 6));
+  }
+  function tripStart(key, gx, gy) {
+    if (!key) return;
+    if (RISK.cur) tripFinish(false);
+    RISK.cur = { key, t0: performance.now(), lost: 0, gx, gy };
+  }
+  function tripFinish(died) {
+    const t = RISK.cur; RISK.cur = null; if (!t) return;
+    const R = rlEnsure(), c = R.risk[t.key] || (R.risk[t.key] = { n: 0, dmg: 0, die: 0 });
+    c.n++; const a = 1 / Math.min(c.n, 30);
+    c.dmg += a * (t.lost - c.dmg); c.die += a * ((died ? 1 : 0) - c.die);
+  }
+  function riskLabel(k) {
+    return `血量${['低', '中', '高'][+k[0]]} 怪${['無', '少', '多'][+k[1]]} 距${['近', '中', '遠'][+k[2]]} ${+k[3] ? '審判' : '一般'} ${+k[4] ? '有Boss' : '無Boss'}`;
+  }
+
+  // ---- 飛行記錄器 + 稽核（需要 ns）----
+  const FR = { player: null, first: true, finished: false, prevHp: null, ring: [], hits: [], run: null, sampleAt: 0 };
+  const BOSS = { seen: new Map() };   // id → { t0, ref, dead }
+  const BQ = {};                       // bossPick 的跨幀狀態
+  function frStart() {
+    FR.ring = []; FR.hits = []; FR.prevHp = null; FR.finished = false; FR.sampleAt = 0; FR.last = null;
+    FR.run = { dmgBy: {}, hitN: {}, ticks: 0, botTicks: 0, aud: { spawned: 0, killed: 0, ttk: 0, dealt: 0, idleMs: 0, focusMs: 0, noTargetMs: 0, switches: 0 } };
+    BOSS.seen = new Map();
+    for (const k of Object.keys(BQ)) delete BQ[k];
+    S.focusId = null; S.focusEnemy = null;
+    FR.lastFocus = null; FR.lastFocusHp = null;
+  }
+  function frTick(ns) {
+    const g = ns.Game, p = g && g.player;
+    if (!p) return;
+    const R = rlEnsure(), tms = performance.now();
+    if (FR.player !== p) {
+      FR.player = p;
+      const resume = FR.first; FR.first = false;
+      frStart();
+      try { rlBeginRun(resume); } catch (e) { console.warn('[PSBot] rlBegin', e); }
+    }
+    if (g.state !== 'playing' || p.dead || FR.finished) return;
+    const run = FR.run; run.ticks++; if (cfg.on && !cfg.record) run.botTicks++;
+    const dt = 100;
+    const hpF = Math.max(0, Math.min(1, p.hp / p.maxHp));
+    const dHp = FR.prevHp == null ? 0 : FR.prevHp - hpF; FR.prevHp = hpF;
+    const J = ns.Judgment, judging = !!(J && J.active);
+    // 掃一遍敵人
+    let nearest = 400, cnt250 = 0, bossNear = false, arc = null; const legsAlive = [], near = [];
+    for (const e of ns.EnemyMgr.all()) {
+      if (e.dead || e.silent) continue;
+      const d = Math.hypot(e.x - p.x, e.y - p.y);
+      if (e.arceus) { arc = { e, d }; continue; }
+      if (e.boss) {
+        legsAlive.push(e);
+        if (!BOSS.seen.has(e.id)) { BOSS.seen.set(e.id, { t0: tms, ref: e, hp0: e.hp }); run.aud.spawned++; }
+        if (d < 300) bossNear = true;
+      }
+      if (d < 360) near.push(e);
+      if (e.behavior !== 'thief') { if (d < nearest) nearest = d; if (d < 250) cnt250++; }
+    }
+    // 傳說有沒有被打倒
+    const alive = new Set(legsAlive.map(e => e.id));
+    for (const [id, v] of BOSS.seen) {
+      if (v.done || alive.has(id)) continue;
+      v.done = true;
+      if (v.ref && (v.ref.dead || v.ref.hp <= 0)) { run.aud.killed++; run.aud.ttk += (tms - v.t0) / 1000; v.killed = true; }
+    }
+    // 掉血歸因
+    if (dHp > 0.004) {
+      const hz = [];
+      for (const h of hazards) if (h.hit && inHazard(h, p.x, p.y, p.r + 6)) hz.push(h);
+      for (const h of hazards) if (!h.hit && hz.length === 0 && inHazard(h, p.x, p.y, p.r) && (h.delay || 0) - (h.t || 0) < 0.15) hz.push(h);
+      const shots = ns.Projectiles.all().filter(s => !s.friendly && Math.abs(s.x - p.x) < 80 && Math.abs(s.y - p.y) < 80);
+      const en = near.slice(); if (arc) en.push(arc.e);
+      const cause = attributeHit({ p, enemies: en, shots, hazards: hz });
+      run.dmgBy[cause] = (run.dmgBy[cause] || 0) + dHp; run.hitN[cause] = (run.hitN[cause] || 0) + 1;
+      FR.hits.push({ at: tms, gt: g.st ? g.st.time : 0, cause, frac: dHp, hpAfter: hpF, mode: S.mode || '', judging });
+      if (FR.hits.length > 40) FR.hits.shift();
+    }
+    // 撿寶行程
+    if (RISK.cur) {
+      if (dHp > 0) RISK.cur.lost += dHp;
+      const og = S.orbGoal;
+      if (!og || Math.abs(og.x - RISK.cur.gx) > 1 || Math.abs(og.y - RISK.cur.gy) > 1 || tms - RISK.cur.t0 > 15000) tripFinish(false);
+    }
+    // 命中稽核：集火目標有沒有真的掉血
+    const fe = S.focusEnemy;
+    if (judging && legsAlive.length) {
+      run.aud.focusMs += dt;
+      if (fe && !fe.dead && fe.boss) {
+        if (FR.lastFocus === fe.id && FR.lastFocusHp != null) {
+          const dd = FR.lastFocusHp - fe.hp;
+          if (dd > 0) run.aud.dealt += dd; else run.aud.idleMs += dt;
+        } else if (FR.lastFocus != null && FR.lastFocus !== fe.id) run.aud.switches++;
+        FR.lastFocus = fe.id; FR.lastFocusHp = fe.hp;
+      } else { run.aud.noTargetMs += dt; FR.lastFocus = null; FR.lastFocusHp = null; }
+    }
+    // 每個 tick 都更新「最新狀態」（死亡報告用它，不會差 0.5 秒）；環形緩衝每 0.5 秒存一筆（保留最近 ~20 秒）
+    let edgeD = null;
+    if (judging && S.jCenter) { const un = (ns.Tiles && ns.Sprites) ? ns.Tiles.T * ns.Sprites.PX : 32; edgeD = Math.round((24 - 1.4) * un - p.r - 6 - Math.hypot(p.x - S.jCenter.x, p.y - S.jCenter.y)); }
+    FR.last = { hp: +hpF.toFixed(3), mode: S.mode || '', near: Math.round(nearest), cnt: cnt250, legs: legsAlive.length, arcD: arc ? Math.round(arc.d) : null, edgeD, judging, trip: !!RISK.cur };
+    if (tms - FR.sampleAt >= 500) { FR.sampleAt = tms; FR.ring.push(FR.last); if (FR.ring.length > 40) FR.ring.shift(); }
+  }
+  // 一局結束：產生死因報告並餵給學習器
+  function frFinish(d) {
+    if (!FR.run || FR.finished) return null;
+    FR.finished = true;
+    const R = rlEnsure(), run = FR.run, tms = performance.now();
+    const botFrac = run.ticks ? run.botTicks / run.ticks : 0;
+    const last = FR.hits[FR.hits.length - 1];
+    const recent = last && (tms - last.at) < 4000;
+    const died = !!(d && (d.time != null));
+    if (RISK.cur) tripFinish(!!recent);
+    const tail = FR.ring.slice(-5).concat(FR.last ? [FR.last] : []);
+    const rep = {
+      at: Date.now(), time: Math.round((d && d.time) || 0), level: (d && d.level) || 0, kills: (d && d.kills) || 0,
+      judge: d && d.judge ? { time: Math.round(d.judge.time || 0), bosses: d.judge.bosses || 0 } : null,
+      cause: recent ? last.cause : '未知', lastHits: FR.hits.slice(-5).map(h => ({ cause: h.cause, pct: Math.round(h.frac * 100), hpAfter: Math.round(h.hpAfter * 100), mode: h.mode, ago: Math.round((tms - h.at) / 100) / 10 })),
+      tail: tail.map(s => ({ hp: Math.round(s.hp * 100), mode: s.mode, near: s.near, cnt: s.cnt, legs: s.legs, arcD: s.arcD, edgeD: s.edgeD })),
+      dmgBy: Object.fromEntries(Object.entries(run.dmgBy).map(([k, v]) => [k, +v.toFixed(2)])), hitN: run.hitN,
+      aud: Object.assign({}, run.aud), botFrac: +botFrac.toFixed(2), tripAtEnd: !!(tail[tail.length - 1] && tail[tail.length - 1].trip),
+      params: R.cur ? Object.fromEntries(Object.entries(R.cur).map(([k, v]) => [k, +(+v).toFixed(3)])) : null, phase: R.active ? R.curPhase : null,
+    };
+    R.deaths.unshift(rep); if (R.deaths.length > 30) R.deaths.length = 30;
+    const A = R.agg; A.runs = (A.runs || 0) + 1; A.time = (A.time || 0) + rep.time;
+    A.deathBy = A.deathBy || {}; A.deathBy[rep.cause] = (A.deathBy[rep.cause] || 0) + 1;
+    A.dmgBy = A.dmgBy || {}; for (const [k, v] of Object.entries(run.dmgBy)) A.dmgBy[k] = +((A.dmgBy[k] || 0) + v).toFixed(2);
+    A.spawned = (A.spawned || 0) + run.aud.spawned; A.killed = (A.killed || 0) + run.aud.killed; A.idleMs = (A.idleMs || 0) + run.aud.idleMs; A.focusMs = (A.focusMs || 0) + run.aud.focusMs;
+    A.noTargetMs = (A.noTargetMs || 0) + run.aud.noTargetMs; A.switches = (A.switches || 0) + run.aud.switches; A.ttk = (A.ttk || 0) + run.aud.ttk;
+    const res = rlEndRun(d || {}, botFrac);
+    rep.score = +(res.score || 0).toFixed(3); rep.z = R.lastZ != null ? +R.lastZ.toFixed(2) : null; rep.rlUsed = !!res.used;
+    save();
+    return rep;
+  }
+  // 審判集火：回傳 focusAim 要打的那隻 { e, dx, dy, d }（沒有就 null）
+  function rlBossForced(ns, p, allList, clearFn) {
+    const legs = allList.filter(c => c.e.boss && !c.e.arceus);
+    if (!legs.length) return null;
+    const t = performance.now();
+    const cands = legs.map(c => { const sn = BOSS.seen.get(c.e.id); return { id: c.e.id, seenAt: sn ? sn.t0 : t, visible: clearFn(c), hp: c.e.hp, c }; });
+    const pick = bossPick(cands, BQ, t, { sightMs: 1500, noDmgMs: 5000, skipMs: 4000 });
+    return pick ? pick.c : null;
+  }
+
+  // ---- 報告 ----
+  const fmtT = s => `${Math.floor((s || 0) / 60)}:${String(Math.floor((s || 0) % 60)).padStart(2, '0')}`;
+  function rlCurve() {
+    const c = cfg.rl.log.filter(x => x.ph === 0).map(x => x.score).slice(-24), n = c.length;
+    if (n < 6) return { n, verdict: `基準局只有 ${n} 局，至少要 6 局（約 18 局）才看得出趨勢` };
+    const xs = c.map((_, i) => i), mx = rlMean(xs), my = rlMean(c);
+    let sxx = 0, sxy = 0; for (let i = 0; i < n; i++) { sxx += (xs[i] - mx) ** 2; sxy += (xs[i] - mx) * (c[i] - my); }
+    const slope = sxy / sxx; let sse = 0; for (let i = 0; i < n; i++) sse += (c[i] - (my + slope * (xs[i] - mx))) ** 2;
+    const se = Math.sqrt(sse / (n - 2) / sxx), t = se > 0 ? slope / se : 0;
+    const h = Math.floor(n / 2), a = rlMean(c.slice(0, h)), b = rlMean(c.slice(h));
+    const verdict = t > 2 ? '✔ 有顯著進步' : t < -2 ? '✘ 顯著退步（退化保護會介入）' : '— 看不出顯著變化（雜訊太大 / 還沒學到）';
+    return { n, slope, t, a, b, verdict };
+  }
+  function rlReport() {
+    const R = rlEnsure(), L = [];
+    const cv = rlCurve(), base = rlBaseline();
+    L.push('══ 強化學習狀態 ══');
+    L.push(`已完成 ${R.runs || 0} 局有效學習局 · 輪次 ${R.cycle || 0} · 下一局：${['基準局(θ)', '正擾動(θ+ε)', '負擾動(θ−ε)'][R.phase || 0]} · 退化回退 ${R.reverts || 0} 次`);
+    L.push(`成績基準（近 ${base.n} 局）：平均 ${base.mean.toFixed(3)} · 標準差 ${base.sd.toFixed(3)}（成績 = 存活 + 審判存活 + 傳說擊倒 + 等級 + 擊倒，不封頂）`);
+    L.push(`學習曲線（基準局 ${cv.n} 局）：` + (cv.slope !== undefined ? `前半 ${cv.a.toFixed(3)} → 後半 ${cv.b.toFixed(3)} · 斜率 ${cv.slope.toFixed(4)}/輪 · t=${cv.t.toFixed(2)} · ${cv.verdict}` : cv.verdict));
+    const dec = rlDecode(R.theta);
+    L.push('參數（目前中心 θ / 預設）：' + RL_SPEC.map(s => `${s.id}=${(+dec[s.id]).toFixed(s.hi > 20 ? 0 : 2)}/${s.def}`).join(' '));
+    const A = R.agg || {};
+    if (A.runs) {
+      L.push('');
+      L.push(`══ 為什麼沒活更久（累計 ${A.runs} 局，平均 ${fmtT(A.time / A.runs)}）══`);
+      const dTot = Object.values(A.deathBy || {}).reduce((x, y) => x + y, 0) || 1;
+      L.push('死因：' + Object.entries(A.deathBy || {}).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k} ${Math.round(v / dTot * 100)}%`).join(' · '));
+      const tot = Object.values(A.dmgBy || {}).reduce((x, y) => x + y, 0) || 1;
+      L.push('總掉血來源：' + Object.entries(A.dmgBy || {}).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([k, v]) => `${k} ${Math.round(v / tot * 100)}%`).join(' · '));
+      L.push(`首領/傳說：生成 ${A.spawned || 0} 隻 · 打倒 ${A.killed || 0} 隻${A.killed ? ` · 平均 ${(A.ttk / A.killed).toFixed(1)} 秒/隻` : ''}`);
+      if (A.focusMs) L.push(`集火稽核：審判中有傳說的時間裡，${Math.round(A.idleMs / A.focusMs * 100)}% 打不到血、${Math.round(A.noTargetMs / A.focusMs * 100)}% 沒有目標、換目標 ${A.switches || 0} 次`);
+    }
+    const D = R.deaths[0];
+    if (D) {
+      L.push('');
+      L.push(`══ 最近一局 ${fmtT(D.time)} Lv${D.level}${D.judge ? ` · 審判 ${fmtT(D.judge.time)}/${D.judge.bosses} 隻傳說` : ''} · 成績 ${D.score}（z=${D.z}）══`);
+      L.push(`死因：${D.cause}${D.tripAtEnd ? '（當時正在去撿寶的路上）' : ''}`);
+      for (const h of D.lastHits) L.push(`　${h.ago}s 前 ${h.cause} -${h.pct}% → 剩 ${h.hpAfter}%（${h.mode}）`);
+      const t = D.tail[D.tail.length - 1];
+      if (t) L.push(`　最後狀態：HP ${t.hp}% · 最近怪 ${t.near}px · 250px 內 ${t.cnt} 隻 · 傳說 ${t.legs} 隻${t.arcD != null ? ` · 阿爾宙斯 ${t.arcD}px` : ''}${t.edgeD != null ? ` · 離場地邊緣 ${t.edgeD}px` : ''}`);
+      L.push(`　掉血：` + (Object.entries(D.dmgBy).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k} ${Math.round(v * 100)}%`).join(' · ') || '無'));
+      if (D.aud && D.aud.spawned) L.push(`　首領/傳說：${D.aud.spawned} 隻生成 / ${D.aud.killed} 隻打倒 · 集火 ${Math.round(D.aud.focusMs / 1000)}s（打不到血 ${Math.round(D.aud.idleMs / 1000)}s、沒目標 ${Math.round(D.aud.noTargetMs / 1000)}s）`);
+    }
+    const rk = Object.entries(R.risk || {}).filter(([, c]) => c.n >= 6).sort((a, b) => (b[1].dmg + 6 * b[1].die) - (a[1].dmg + 6 * a[1].die));
+    if (rk.length) {
+      L.push('');
+      L.push('══ 什麼情況撿寶最危險 / 最安全（平均掉血% · 死亡率 · 次數）══');
+      for (const [k, c] of rk.slice(0, 4)) L.push(`　危險 ${riskLabel(k)}：${(c.dmg * 100).toFixed(1)}% · ${(c.die * 100).toFixed(0)}% · n=${c.n}`);
+      for (const [k, c] of rk.slice(-3).reverse()) L.push(`　安全 ${riskLabel(k)}：${(c.dmg * 100).toFixed(1)}% · ${(c.die * 100).toFixed(0)}% · n=${c.n}`);
+    }
+    return L.join('\n');
+  }
+  function exportRL() {
+    try {
+      const blob = new Blob([JSON.stringify({ app: 'psbot', kind: 'rl', v: 1, at: new Date().toISOString(), rl: cfg.rl, report: rlReport() }, null, 1)], { type: 'application/json' });
+      const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `psbot-rl-${new Date().toISOString().slice(0, 10)}.json`; a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+    } catch (e) { log('RL 匯出失敗', e.message); }
+  }
+  function resetRL() {
+    const keep = { on: cfg.rl.on, bossQueue: cfg.rl.bossQueue };
+    cfg.rl = JSON.parse(JSON.stringify(DEFAULTS.rl)); Object.assign(cfg.rl, keep); rlEnsure(); save(); log('RL reset');
+  }
+  // @@RL-END
+
+
   // ---------- 3. 主程式 ----------
   function boot(ns) {
     // 除錯用：放在 Symbol 下，不可列舉，避免 window 上的明字鍵名觸發偵測
-    try { Object.defineProperty(window, Symbol.for('psbot.debug'), { value: { ns, cfg, stats, S, steer, learn: { exportLearn, importLearnFile, mergeLearn, resetLearn, cardBias, bondBias, itemBias, learnedMove, fearModel: () => fearModel(ns), healThreshold }, brain: { buildBrain, adaptBrain, exportBrain, importBrainFile, brainGet, brainSet, PARAM_REGISTRY } }, configurable: true }); } catch {}
+    try { Object.defineProperty(window, Symbol.for('psbot.debug'), { value: { ns, cfg, stats, S, learn: { exportLearn, importLearnFile, mergeLearn, resetLearn, cardBias, bondBias, itemBias, learnedMove, fearModel, healThreshold }, brain: { buildBrain, adaptBrain, exportBrain, importBrainFile, brainGet, brainSet, PARAM_REGISTRY }, rl: { report: rlReport, state: () => cfg.rl, FR, RISK, BOSS, BQ } }, configurable: true }); } catch {}
     log('namespace captured, version', VERSION);
     // 核心模組都認出來、DOM 也好了才 patch。其他模組晚一點就緒沒關係（用到的地方都有防護）。
     const need = ['Game', 'Input', 'RunUI', 'LevelUp', 'Moves', 'DEX_BY', 'UI', 'T'];
@@ -323,7 +692,7 @@
     }, 50);
   }
 
-  const S = { pickTimer: null, lastPos: null, stuckT: 0, unstickT: 0, unstickDir: null, wanderA: Math.random() * 6.28, lastSlotCheck: 0, lastOrb: 0, lastT: performance.now(), overAt: -1e9, againAt: -1e9, lobbyAt: -1e9, coopFull: true, fullLogAt: -1e9, lastPlay: -1e9, pausedAt: 0, userPausedAt: -1e9, lastDir: null, lastOffer: null, orbGoal: null, plan: null, seen: {}, ban: {}, noGo: {}, jCenter: null, holding: false, holdKey: null, holdSince: 0, wd: null, losBadT: 0, spin: 1, spinBlockT: 0, loopC: null, dirIdx: -1, holdT: 0, out: [1, 0], rec: { cards: null, runActive: false, runMin: 1, saveAt: 0, player: null, dex: null, runCards: [], runBonds: [], runItems: [], runHpSum: 0, runHpN: 0, runDistSum: 0, runDistN: 0, runStartedAt: 0 }, recMsg: '', recMsgAt: 0 };
+  const S = { pickTimer: null, lastPos: null, stuckT: 0, unstickT: 0, unstickDir: null, wanderA: Math.random() * 6.28, lastSlotCheck: 0, lastOrb: 0, lastT: performance.now(), overAt: -1e9, againAt: -1e9, lobbyAt: -1e9, coopFull: true, fullLogAt: -1e9, lastPlay: -1e9, pausedAt: 0, userPausedAt: -1e9, lastDir: null, lastOffer: null, orbGoal: null, plan: null, seen: {}, ban: {}, noGo: {}, jCenter: null, holding: false, holdKey: null, holdSince: 0, wd: null, losBadT: 0, spin: 1, spinBlockT: 0, loopC: null, dirIdx: -1, holdT: 0, out: [1, 0], rec: { cards: null, runActive: false, runMin: 1, saveAt: 0, player: null, runCards: [], runBonds: [], runItems: [], runHpSum: 0, runHpN: 0, runDistSum: 0, runDistN: 0, runStartedAt: 0 }, recMsg: '', recMsgAt: 0 };
 
   function patch(ns) {
     // --- 走位：接管 Input.axis()，玩家自己按方向鍵時讓玩家優先 ---
@@ -413,6 +782,7 @@
     const origOver = R.showOver;
     R.showOver = function (d) {
       // 記錄模式 或 自主學習：這一局算一局樣本
+      try { frFinish(d); } catch (e) { console.warn('[PSBot] frFinish', e); }
       if (cfg.record || (cfg.on && cfg.selfLearn)) finishLearnRun(d);
       const r = origOver.apply(this, arguments);
       if (cfg.on) {
@@ -440,6 +810,7 @@
     }
 
     trackHazards(ns);
+    setInterval(() => { try { frTick(ns); } catch (e) { console.warn('[PSBot] frTick', e); } }, 100);
 
     // --- 每 200ms 的雜務：切換主動欄位、用寶珠、自動再開一局、被暫停就繼續 ---
     // coopFull：多人第一次開局要等房間滿。關掉 bot 就重置，下次開啟重新要求滿房。
@@ -447,18 +818,6 @@
       // 記錄模式：只取樣人類的走位，其他自動功能全部停手（由你自己打）
       if (cfg.record) { try { sampleHuman(ns); } catch (e) { console.warn('[PSBot] record', e); } return; }
       if (!cfg.on) { S.coopFull = true; return; }
-      // per-Pokémon brain switch (runs regardless of selfLearn)
-      try {
-        const p = ns.Game.player;
-        if (p && p.dex != null && S.rec.dex != null && S.rec.dex !== p.dex) {
-          cfg.brains[S.rec.dex] = JSON.parse(JSON.stringify(cfg.brain));
-          if (cfg.brains[p.dex]) cfg.brain = cfg.brains[p.dex];
-          else { cfg.brain = { v: 1, nodes: {}, edges: [], updatedAt: 0 }; buildBrain(); }
-          save();
-          log('brain switched: ' + S.rec.dex + ' -> ' + p.dex);
-        }
-        if (p && p.dex != null) S.rec.dex = p.dex;
-      } catch (e) {}
       // 自主學習：bot 自己打時也追蹤本局選擇與走位（供 finishLearnRun 使用）
       if (cfg.selfLearn) {
         try {
@@ -468,24 +827,6 @@
             S.rec.runCards = []; S.rec.runBonds = []; S.rec.runItems = [];
             S.rec.runHpSum = 0; S.rec.runHpN = 0; S.rec.runDistSum = 0; S.rec.runDistN = 0;
             S.rec.runStartedAt = Date.now();
-            // per-Pokémon brain switch
-            try {
-              const newDex = p.dex;
-              if (S.rec.dex != null && S.rec.dex !== newDex) {
-                // save current brain under old dex
-                cfg.brains[S.rec.dex] = JSON.parse(JSON.stringify(cfg.brain));
-                // load new dex brain or create
-                if (cfg.brains[newDex]) {
-                  cfg.brain = cfg.brains[newDex];
-                } else {
-                  cfg.brain = { v: 1, nodes: {}, edges: [], updatedAt: 0 };
-                  buildBrain();
-                }
-                save();
-                log('brain switched: ' + S.rec.dex + ' -> ' + newDex);
-              }
-              S.rec.dex = newDex;
-            } catch (e) { console.warn('[PSBot] brain switch', e); }
           }
           if (p && !p.dead && ns.Game.state === 'playing') {
             const hp = Math.max(0, Math.min(1, p.hp / p.maxHp));
@@ -578,16 +919,6 @@
   function sampleHuman(ns) {
     const p = ns.Game.player;
     if (!p) return;
-    // per-Pokémon brain switch
-    try {
-      if (S.rec.dex != null && S.rec.dex !== p.dex) {
-        cfg.brains[S.rec.dex] = JSON.parse(JSON.stringify(cfg.brain));
-        if (cfg.brains[p.dex]) cfg.brain = cfg.brains[p.dex];
-        else { cfg.brain = { v: 1, nodes: {}, edges: [], updatedAt: 0 }; buildBrain(); }
-        save();
-      }
-      S.rec.dex = p.dex;
-    } catch (e) {}
     // 換局（新的 player 物件）就重新計算單局最低血量與本局統計
     if (S.rec.player !== p) {
       S.rec.player = p; S.rec.runMin = 1;
@@ -613,43 +944,10 @@
     const t = performance.now();
     if (t - (S.rec.saveAt || 0) > 5000) { S.rec.saveAt = t; save(); }
   }
-  // 死亡原因偵測：分析死亡時的遊戲狀態
-  function detectDeathCause(ns, d) {
-    if (!d.dead) return 'survived';
-    try {
-      const p = ns.Game.player;
-      const judging = !!(ns.Judgment && ns.Judgment.active);
-      // 檢查周圍敵人
-      let nearBoss = false, nearMob = false, nearProjectile = false;
-      for (const e of ns.EnemyMgr.all()) {
-        if (e.dead) continue;
-        const dd = Math.hypot(e.x - p.x, e.y - p.y);
-        if (dd < 100) {
-          if (e.boss || e.arceus) nearBoss = true;
-          else nearMob = true;
-        }
-      }
-      // 檢查是否有地面預警/彈幕
-      // (簡化：如果 HP 非常低且周圍有 boss → boss kill)
-      if (nearBoss) return 'boss';
-      if (nearMob) return 'mob';
-      // 檢查是否在審判中
-      if (judging) return 'projectile';
-      // 檢查 HP 是否極低（可能被彈幕/地面預警擊殺）
-      if (p && p.hp <= 0) {
-        // 如果周圍沒有敵人，可能是遠程攻擊
-        let anyNear = false;
-        for (const e of ns.EnemyMgr.all()) {
-          if (!e.dead && Math.hypot(e.x - p.x, e.y - p.y) < 200) { anyNear = true; break; }
-        }
-        if (!anyNear) return 'projectile';
-      }
-      return 'unknown';
-    } catch (e) { return 'unknown'; }
-  }
-
   // 局品質：存活時間（秒）為主，加上等級/擊倒加權；正規化到 0~1（以 300 秒為滿分）
   function runQuality(d) {
+    // 舊公式 300 秒就封頂 → 撐到 30 分鐘的局每局都是 1.0，等於沒有訊號。RL 開著時改用 z 標準化的優勢值（0.5 = 平均）
+    if (cfg.rl && cfg.rl.on && !cfg.record && cfg.rl.lastZ != null) return Math.max(0.05, Math.min(0.95, 0.5 + 0.25 * cfg.rl.lastZ));
     const t = Math.max(0, Math.min(300, d.time || 0));
     const lvl = Math.max(0, d.level || 0);
     const kills = Math.max(0, d.kills || 0);
@@ -659,34 +957,11 @@
   function finishLearnRun(d) {
     const L = cfg.learn;
     const q = runQuality(d);
+    const rlActive = !!(cfg.rl && cfg.rl.on && !cfg.record);   // RL 接手走位參數，舊的「拿自己這局平均血量當參數」自我模仿停用
     // 本局平均走位
     const avgHp = S.rec.runHpN > 0 ? S.rec.runHpSum / S.rec.runHpN : null;
     const avgDist = S.rec.runDistN > 0 ? S.rec.runDistSum / S.rec.runDistN : null;
-    const deathCause = detectDeathCause(ns, d);
     L.runs++;
-    // 死亡原因追蹤
-    if (d.dead && L.deathCauses) {
-      const c = deathCause in L.deathCauses ? deathCause : 'unknown';
-      L.deathCauses[c] = (L.deathCauses[c] || 0) + 1;
-    }
-    // 獎勵安全追蹤：minHp 低表示冒險撿獎勵
-    if (L.rewardSafety) {
-      if (S.rec.runMin != null && S.rec.runMin < 0.2) L.rewardSafety.unsafe++;
-      else L.rewardSafety.safe++;
-      if (d.dead) L.rewardSafety.died++;
-      L.rewardSafety.totalHpLost += (1 - (S.rec.runMin || 1));
-    }
-    // 寶可夢強弱追蹤
-    const dex = S.rec.dex || (ns.Game.player && ns.Game.player.dex);
-    if (dex != null) {
-      if (!L.pokeStrength[dex]) L.pokeStrength[dex] = { runs: 0, avgTime: 0, avgLevel: 0, avgKills: 0, bestTime: 0 };
-      const ps = L.pokeStrength[dex];
-      ps.runs++;
-      ps.avgTime = ps.avgTime * 0.8 + (d.time || 0) * 0.2;
-      ps.avgLevel = ps.avgLevel * 0.8 + (d.level || 0) * 0.2;
-      ps.avgKills = ps.avgKills * 0.8 + (d.kills || 0) * 0.2;
-      if ((d.time || 0) > ps.bestTime) ps.bestTime = d.time || 0;
-    }
     if (S.rec.runMin != null) {
       const M = L.move;
       M.min = M.min == null ? S.rec.runMin : M.min * 0.7 + S.rec.runMin * 0.3;
@@ -703,27 +978,14 @@
     for (const k of S.rec.runCards) updateVal('cards', k);
     for (const k of S.rec.runBonds) updateVal('bonds', k);
     for (const k of S.rec.runItems) updateVal('items', k);
-    // 狀態條件參數：依狀態桶儲存恐懼參數
-    const stateBucket = (avgHp != null) ? (avgHp < 0.4 ? 'low' : avgHp < 0.7 ? 'mid' : 'high') + (ns.Judgment && ns.Judgment.active ? '_boss' : '') : null;
-    if (stateBucket && avgHp != null && q > 0.3) {
-      if (!L.stateParams[stateBucket]) L.stateParams[stateBucket] = { fearLow: null, fearMid: null, fearK: null, n: 0 };
-      const sp = L.stateParams[stateBucket];
-      const targetLow = Math.max(0.2, Math.min(0.5, avgHp * 0.55));
-      const targetMid = Math.max(0.45, Math.min(0.75, avgHp * 0.9));
-      const targetK = Math.max(0.7, Math.min(1.4, 0.9 + ((avgDist || 140) - 140) / 400));
-      sp.fearLow = sp.fearLow == null ? targetLow : sp.fearLow * 0.85 + targetLow * 0.15;
-      sp.fearMid = sp.fearMid == null ? targetMid : sp.fearMid * 0.85 + targetMid * 0.15;
-      sp.fearK = sp.fearK == null ? targetK : sp.fearK * 0.85 + targetK * 0.15;
-      sp.n++;
-    }
     // outcome-aware：走位參數 EMA（品質加權：品質高才更新，避免學壞習慣）
-    if (avgHp != null && q > 0.3) {
+    if (!rlActive && avgHp != null && q > 0.3) {
       const P = L.params;
       if (!(P.locked && P.locked.fearLow)) P.fearLow = P.fearLow == null ? Math.max(0.2, Math.min(0.5, avgHp * 0.55)) : P.fearLow * 0.85 + Math.max(0.2, Math.min(0.5, avgHp * 0.55)) * 0.15;
       if (!(P.locked && P.locked.fearMid)) P.fearMid = P.fearMid == null ? Math.max(0.45, Math.min(0.75, avgHp * 0.9)) : P.fearMid * 0.85 + Math.max(0.45, Math.min(0.75, avgHp * 0.9)) * 0.15;
       if (!(P.locked && P.locked.fearK)) P.fearK = P.fearK == null ? Math.max(0.7, Math.min(1.4, 0.9 + ((avgDist || 140) - 140) / 400)) : P.fearK * 0.85 + Math.max(0.7, Math.min(1.4, 0.9 + ((avgDist || 140) - 140) / 400)) * 0.15;
     }
-    if (S.rec.runMin != null && q > 0.3) {
+    if (!rlActive && S.rec.runMin != null && q > 0.3) {
       const P = L.params;
       const target = Math.max(0.25, Math.min(0.6, (S.rec.runMin || 0.35) * 1.1));
       if (!(P.locked && P.locked.healThr)) P.healThr = P.healThr == null ? target : P.healThr * 0.85 + target * 0.15;
@@ -738,8 +1000,7 @@
     // 局歷史
     if (!Array.isArray(L.history)) L.history = [];
     L.history.push({ at: Date.now(), time: d.time || 0, level: d.level || 0, kills: d.kills || 0, q,
-      minHp: S.rec.runMin, avgHp, avgDist, cards: S.rec.runCards.slice(), bonds: S.rec.runBonds.slice(), items: S.rec.runItems.slice(),
-      bosses: d.bosses || 0, coins: d.coins || 0, dead: !!d.dead, breakdown: d.breakdown || '' });
+      minHp: S.rec.runMin, avgHp, avgDist, cards: S.rec.runCards.slice(), bonds: S.rec.runBonds.slice(), items: S.rec.runItems.slice() });
     if (L.history.length > 30) L.history = L.history.slice(-30);
     S.rec.player = null;
     S.rec.runActive = false;
@@ -757,45 +1018,33 @@
     return { hp: M.hp / M.n, dist: Math.min(400, M.dist / M.n), min: M.min };
   }
   // 補血卡門檻：優先用 outcome-aware 參數；其次看你選補血卡時的血量；再來是你平常的血量
-  // 死亡原因影響：如果經常被 mob 殺死，降低補血門檻
   function healThreshold() {
-    const L = cfg.learn;
-    let base = 0.35;
-    if (L && L.deathCauses) {
-      const total = Object.values(L.deathCauses).reduce((a, b) => a + b, 0);
-      if (total > 0 && (L.deathCauses.mob || 0) / total > 0.5) base = 0.25; // 經常被 mob 殺，更早補血
-      if (total > 0 && (L.deathCauses.boss || 0) / total > 0.5) base = 0.4;  // 經常被 boss 殺，稍微更早補血
-    }
+    if (cfg.rl && cfg.rl.on && cfg.rl.cur && !cfg.record) return cfg.rl.cur.healThr;
     const P = cfg.learn.params;
     if (P && typeof P.healThr === 'number' && isFinite(P.healThr) && !(P.locked && P.locked.healThr)) return P.healThr;
     if (P && typeof P.healThr === 'number' && isFinite(P.healThr)) return P.healThr;
     const H = cfg.learn.heal;
     if (H && (H.n | 0) >= 2) return Math.max(0.25, Math.min(0.6, H.hp / H.n + 0.05));
     const lm = learnedMove();
-    return lm ? Math.max(0.25, Math.min(0.6, lm.hp * 0.6)) : base;
+    return lm ? Math.max(0.25, Math.min(0.5, lm.hp * 0.6)) : 0.35;
   }
   // 恐懼模型：人類平均血量高 / 站得遠 = 保守，門檻上移、恐懼放大；反過來就放寬
-  function fearModel(ns) {
+  function fearModel() {
+    if (cfg.rl && cfg.rl.on && cfg.rl.cur && !cfg.record) return { low: cfg.rl.cur.fearLow, mid: cfg.rl.cur.fearMid, k: cfg.rl.cur.fearK };
     const P = cfg.learn.params;
+    const useP = P && (P.fearLow != null || P.fearMid != null || P.fearK != null);
     const lm = learnedMove();
-    // 狀態條件：依當前 HP 和 boss 狀態選擇 bucket
-    const p = ns ? ns.Game.player : null;
-    const hpPct = p ? p.hp / p.maxHp : 0.5;
-    const bucket = (hpPct < 0.4 ? 'low' : hpPct < 0.7 ? 'mid' : 'high') + (ns && ns.Judgment && ns.Judgment.active ? '_boss' : '');
-    const sp = cfg.learn.stateParams && cfg.learn.stateParams[bucket];
+    if (!lm && !useP) return { low: 0.35, mid: 0.6, k: 1 };
     let low = 0.35, mid = 0.6, k = 1;
-    if (sp && sp.n >= 2) {
-      if (typeof sp.fearLow === 'number') low = sp.fearLow;
-      if (typeof sp.fearMid === 'number') mid = sp.fearMid;
-      if (typeof sp.fearK === 'number') k = sp.fearK;
-    } else if (lm) {
+    if (lm) {
       const shift = Math.max(-0.12, Math.min(0.12, (lm.hp - 0.65) * 0.4));
       low = 0.35 + shift; mid = 0.6 + shift;
       k = Math.max(0.7, Math.min(1.4, 0.9 + (lm.dist - 140) / 400 + (lm.hp - 0.65) * 0.8));
     }
     // outcome-aware 參數覆寫（若已學到且未鎖定）
     if (P) {
-      if (typeof P.fearLow === 'number' && isFinite(P.fearLow)) low = P.fearLow;
+      if (typeof P.fearLow === 'number' && isFinite(P.fearLow) && !(P.locked && P.locked.fearLow)) low = P.fearLow;
+      else if (typeof P.fearLow === 'number' && isFinite(P.fearLow)) low = P.fearLow;
       if (typeof P.fearMid === 'number' && isFinite(P.fearMid)) mid = P.fearMid;
       if (typeof P.fearK === 'number' && isFinite(P.fearK)) k = P.fearK;
     }
@@ -920,27 +1169,6 @@
     { id: 'cfg.record', label: '記錄模式', cat: 'core', type: 'bool', def: false, desc: '人類示範' },
     { id: 'cfg.selfLearn', label: '自主學習', cat: 'core', type: 'bool', def: true, desc: 'bot 自己學' },
     { id: 'cfg.exploreRate', label: '探索率', cat: 'brain', type: 'number', def: 0.05, min: 0, max: 0.3, step: 0.01, desc: 'epsilon-greedy 探索' },
-    // --- 生存 / 獎勵 / BOSS ---
-    { id: 'surv.healUrgent', label: '緊急補血線', cat: 'survival', type: 'number', def: 0.25, min: 0.1, max: 0.5, step: 0.01, desc: '低於此血量最優先補血' },
-    { id: 'surv.orbDanger', label: '寶珠危險線', cat: 'survival', type: 'number', def: 0.4, min: 0.1, max: 0.7, step: 0.05, desc: '低於此血量用寶珠' },
-    { id: 'surv.retreatBoss', label: 'BOSS迴避距離', cat: 'survival', type: 'number', def: 330, min: 200, max: 500, step: 10, desc: 'BOSS接近時保持距離' },
-    { id: 'surv.rewardSafeHp', label: '撿獎勵最低血量', cat: 'survival', type: 'number', def: 0.5, min: 0.2, max: 0.8, step: 0.05, desc: '血量低於此不撿獎勵' },
-    { id: 'surv.rewardSafeDist', label: '撿獎勵安全距離', cat: 'survival', type: 'number', def: 200, min: 100, max: 400, step: 10, desc: '周圍敵人距離超過此值才撿' },
-    { id: 'boss.prioritizeLowHp', label: '優先低血BOSS', cat: 'boss', type: 'bool', def: true, desc: '優先攻擊血量最低的BOSS' },
-    { id: 'boss.prioritizeHighDmg', label: '優先高傷BOSS', cat: 'boss', type: 'bool', def: true, desc: '優先攻擊傷害最高的BOSS' },
-    { id: 'boss.arceusFocus', label: '阿爾宙斯優先', cat: 'boss', type: 'bool', def: false, desc: '審判時優先打阿爾宙斯' },
-    { id: 'reward.coinPriority', label: '金幣優先度', cat: 'reward', type: 'number', def: 2, min: 0, max: 5, step: 0.5, desc: '金幣拾取優先度' },
-    { id: 'reward.xpPriority', label: '經驗優先度', cat: 'reward', type: 'number', def: 1, min: 0, max: 5, step: 0.5, desc: '經驗球拾取優先度' },
-    { id: 'reward.ticketPriority', label: '抽獎券優先度', cat: 'reward', type: 'number', def: 9, min: 0, max: 15, step: 1, desc: '抽獎券拾取優先度' },
-    // 傳送門 / 風險決策
-    { id: 'portal.enterHp', label: '進入傳送門血量', cat: 'portal', type: 'number', def: 0.7, min: 0.3, max: 1.0, step: 0.05, desc: '血量高於此才進傳送門' },
-    { id: 'portal.enterDist', label: '傳送門安全距離', cat: 'portal', type: 'number', def: 300, min: 100, max: 500, step: 10, desc: '周圍敵人距離超過此值才進' },
-    { id: 'portal.riskTolerance', label: '風險容忍度', cat: 'portal', type: 'number', def: 0.5, min: 0, max: 1, step: 0.05, desc: '高風險高回報決策閾值' },
-    { id: 'portal.rewardThreshold', label: '獎勵門檻', cat: 'portal', type: 'number', def: 1.5, min: 0.5, max: 5, step: 0.1, desc: '預期獎勵超過此值才冒險' },
-    { id: 'portal.lateGameBonus', label: '後期加成', cat: 'portal', type: 'number', def: 2.0, min: 1, max: 5, step: 0.1, desc: '後期（>20min）進入傳送門的回報加成' },
-    // 死亡/獎勵學習參數
-    { id: 'surv.deathBossPenalty', label: 'BOSS死亡懲罰', cat: 'survival', type: 'number', def: 0.5, min: 0, max: 1, step: 0.1, desc: '被BOSS殺死時的學習懲罰' },
-    { id: 'surv.deathMobPenalty', label: '小怪死亡懲罰', cat: 'survival', type: 'number', def: 0.3, min: 0, max: 1, step: 0.1, desc: '被小怪殺死時的學習懲罰' },
     // --- 移動 / 戰鬥 ---
     { id: 'steer.fearLow', label: '恐懼門檻(低血)', cat: 'movement', type: 'number', def: 0.35, min: 0.15, max: 0.6, step: 0.01, humanTrackable: true, humanSource: 'learn.params.fearLow', desc: '低血量時恐懼係數切換點' },
     { id: 'steer.fearMid', label: '恐懼門檻(中血)', cat: 'movement', type: 'number', def: 0.6, min: 0.4, max: 0.8, step: 0.01, humanTrackable: true, humanSource: 'learn.params.fearMid', desc: '中血量時恐懼係數切換點' },
@@ -979,13 +1207,13 @@
     { id: 'brain.minEvidence', label: '最小證據數', cat: 'brain', type: 'number', def: 3, min: 1, max: 10, step: 1, desc: '生效所需樣本' },
     { id: 'brain.historySize', label: '歷史局數', cat: 'brain', type: 'number', def: 30, min: 10, max: 100, step: 5, desc: '保留局數' },
   ];
-  const BRAIN_CATS = ['core', 'movement', 'learning', 'scoring', 'survival', 'boss', 'reward', 'portal', 'brain'];
-  const BRAIN_CAT_LABEL = { core: '核心開關', movement: '移動/戰鬥', learning: '學習強度', scoring: '選卡評分', survival: '生存/獎勵', boss: 'BOSS策略', reward: '獎勵優先', portal: '傳送門/風險', brain: '腦超參數' };
+  const BRAIN_CATS = ['core', 'movement', 'learning', 'scoring', 'brain'];
+  const BRAIN_CAT_LABEL = { core: '核心開關', movement: '移動/戰鬥', learning: '學習強度', scoring: '選卡評分', brain: '腦超參數' };
 
   // 取得參數當前值（依 id 路徑）
   function brainGet(id) {
     const parts = id.split('.');
-    let o = (parts[0] === 'cfg') ? cfg : (parts[0] === 'learn') ? cfg.learn : (parts[0] === 'steer') ? cfg.steer : (parts[0] === 'score') ? null : (parts[0] === 'statPri') ? cfg.statPri : (parts[0] === 'surv') ? (cfg.surv || (cfg.surv = {})) : (parts[0] === 'boss') ? (cfg.boss || (cfg.boss = {})) : (parts[0] === 'reward') ? (cfg.reward || (cfg.reward = {})) : (parts[0] === 'portal') ? (cfg.portal || (cfg.portal = {})) : (parts[0] === 'brain') ? cfg.brain : null;
+    let o = (parts[0] === 'cfg') ? cfg : (parts[0] === 'learn') ? cfg.learn : (parts[0] === 'steer') ? cfg.steer : (parts[0] === 'score') ? null : (parts[0] === 'statPri') ? cfg.statPri : (parts[0] === 'brain') ? cfg.brain : null;
     // score 特殊：cfg 沒有 score，用 cfg.learn.params 或 cfg.steer
     if (parts[0] === 'score') {
       if (parts[1] === 'passiveFirst') return cfg.passiveFirst;
@@ -1005,7 +1233,7 @@
       if (parts[1] === 'cdWeight') { cfg.steer.cdWeight = v; return; }
       return;
     }
-    let o = (parts[0] === 'cfg') ? cfg : (parts[0] === 'learn') ? cfg.learn : (parts[0] === 'steer') ? cfg.steer : (parts[0] === 'statPri') ? cfg.statPri : (parts[0] === 'surv') ? (cfg.surv || (cfg.surv = {})) : (parts[0] === 'boss') ? (cfg.boss || (cfg.boss = {})) : (parts[0] === 'reward') ? (cfg.reward || (cfg.reward = {})) : (parts[0] === 'portal') ? (cfg.portal || (cfg.portal = {})) : (parts[0] === 'brain') ? cfg.brain : null;
+    let o = (parts[0] === 'cfg') ? cfg : (parts[0] === 'learn') ? cfg.learn : (parts[0] === 'steer') ? cfg.steer : (parts[0] === 'statPri') ? cfg.statPri : (parts[0] === 'brain') ? cfg.brain : null;
     if (!o) return;
     const keys = parts.slice(1);
     for (let i = 0; i < keys.length - 1; i++) { if (o[keys[i]] == null) o[keys[i]] = {}; o = o[keys[i]]; }
@@ -1083,12 +1311,6 @@
       ['steer.springHp', 'concept:survival'], ['steer.magnetBase', 'concept:efficiency'],
       ['steer.farmHpOn', 'concept:efficiency'], ['steer.farmHpOff', 'concept:safety'],
       ['cfg.focus', 'concept:efficiency'], ['cfg.passiveFirst', 'concept:xp_gain'],
-      ['surv.healUrgent', 'concept:survival'], ['surv.orbDanger', 'concept:survival'],
-      ['surv.retreatBoss', 'concept:safety'], ['surv.rewardSafeHp', 'concept:survival'],
-      ['boss.prioritizeLowHp', 'concept:efficiency'], ['boss.arceusFocus', 'concept:survival'],
-      ['reward.xpPriority', 'concept:xp_gain'], ['reward.coinPriority', 'concept:efficiency'],
-      ['portal.enterHp', 'concept:survival'], ['portal.riskTolerance', 'concept:efficiency'],
-      ['portal.rewardThreshold', 'concept:efficiency'], ['portal.lateGameBonus', 'concept:efficiency'],
     ];
     // 組合邊：參數交互（fearLow × retreatDist → safety 等）
     const combos = [
@@ -1097,9 +1319,6 @@
       ['learn.cardStr', 'score.xpWeight', 'concept:xp_gain'],
       ['learn.bondStr', 'learn.itemStr', 'concept:efficiency'],
       ['steer.orbHp', 'steer.healCardHp', 'concept:survival'],
-      ['portal.enterHp', 'portal.riskTolerance', 'concept:survival'],
-      ['surv.rewardSafeHp', 'surv.rewardSafeDist', 'concept:survival'],
-      ['boss.prioritizeLowHp', 'boss.prioritizeHighDmg', 'concept:efficiency'],
     ];
     for (const [a, b, c] of combos) {
       if (B.nodes[a] && B.nodes[b] && B.nodes[c]) {
@@ -1161,8 +1380,8 @@
     try {
       buildBrain();
       const data = { app: 'psbot', kind: 'brain', v: 1, at: new Date().toISOString(),
-        cfg: { on: cfg.on, move: cfg.move, cards: cfg.cards, bonds: cfg.bonds, items: cfg.items, rift: cfg.rift, orbs: cfg.orbs, restart: cfg.restart, noRank: cfg.noRank, farm: cfg.farm, focus: cfg.focus, passiveFirst: cfg.passiveFirst, record: cfg.record, selfLearn: cfg.selfLearn, exploreRate: cfg.exploreRate, steer: cfg.steer, statPri: cfg.statPri, surv: cfg.surv, boss: cfg.boss, reward: cfg.reward, portal: cfg.portal, profiles: cfg.profiles },
-        learn: cfg.learn, brain: cfg.brain, brains: cfg.brains };
+        cfg: { on: cfg.on, move: cfg.move, cards: cfg.cards, bonds: cfg.bonds, items: cfg.items, rift: cfg.rift, orbs: cfg.orbs, restart: cfg.restart, noRank: cfg.noRank, farm: cfg.farm, focus: cfg.focus, passiveFirst: cfg.passiveFirst, record: cfg.record, steer: cfg.steer, profiles: cfg.profiles },
+        learn: cfg.learn, brain: cfg.brain };
       const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
       const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
       a.download = `psbot-brain-${new Date().toISOString().slice(0, 10)}.json`;
@@ -1182,43 +1401,11 @@
         if (!src) throw new Error('不是 PSBot 腦檔案');
         if (src.cfg && typeof src.cfg === 'object') {
           if (src.cfg.steer) Object.assign(cfg.steer, src.cfg.steer);
-          if (src.cfg.statPri) Object.assign(cfg.statPri, src.cfg.statPri);
-          if (src.cfg.surv) Object.assign(cfg.surv, src.cfg.surv);
-          if (src.cfg.boss) Object.assign(cfg.boss, src.cfg.boss);
-          if (src.cfg.reward) Object.assign(cfg.reward, src.cfg.reward);
-          if (src.cfg.portal) Object.assign(cfg.portal, src.cfg.portal);
-          for (const k of ['move','cards','bonds','items','rift','orbs','restart','noRank','farm','focus','passiveFirst','selfLearn']) {
+          for (const k of ['move','cards','bonds','items','rift','orbs','restart','noRank','farm','focus','passiveFirst']) {
             if (typeof src.cfg[k] === 'boolean') cfg[k] = src.cfg[k];
           }
-          if (typeof src.cfg.exploreRate === 'number' && isFinite(src.cfg.exploreRate)) cfg.exploreRate = src.cfg.exploreRate;
         }
         if (src.learn) mergeLearn(src.learn);
-        if (src.brains && typeof src.brains === 'object') {
-          for (const [dex, b] of Object.entries(src.brains)) {
-            if (!b || typeof b !== 'object') continue;
-            if (!cfg.brains[dex]) cfg.brains[dex] = JSON.parse(JSON.stringify(b));
-            else {
-              // merge brains
-              const ex = cfg.brains[dex];
-              for (const [id, n] of Object.entries(b.nodes || {})) {
-                if (!ex.nodes[id]) ex.nodes[id] = JSON.parse(JSON.stringify(n));
-                else {
-                  const w1 = ex.nodes[id].evidence || 1, w2 = n.evidence || 1;
-                  ex.nodes[id].value = (ex.nodes[id].value * w1 + (n.value || ex.nodes[id].value) * w2) / (w1 + w2);
-                  ex.nodes[id].evidence = (ex.nodes[id].evidence || 0) + (n.evidence || 0);
-                }
-              }
-              const key = e => e.from + '|' + e.to + '|' + e.rel;
-              const idx = new Map(ex.edges.map((e, i) => [key(e), i]));
-              for (const e of (b.edges || [])) {
-                if (!e || !e.from || !e.to) continue;
-                const i = idx.get(key(e));
-                if (i == null) { ex.edges.push(JSON.parse(JSON.stringify(e))); idx.set(key(e), ex.edges.length - 1); }
-                else { const ex2 = ex.edges[i]; const w1 = ex2.evidence || 1, w2 = e.evidence || 1; ex2.w = (ex2.w * w1 + (e.w || ex2.w) * w2) / (w1 + w2); ex2.evidence = (ex2.evidence || 0) + (e.evidence || 0); }
-              }
-            }
-          }
-        }
         if (src.brain && src.brain.nodes) {
           const B = cfg.brain;
           // 節點：union，值加權平均
@@ -1316,7 +1503,7 @@
       ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
     }
     // 節點
-    const catColor = { core: '#ff8ad8', movement: '#4aa3ff', learning: '#ffd23f', scoring: '#9fb1c9', survival: '#ff6b6b', boss: '#ff9f43', reward: '#54a0ff', portal: '#a29bfe', brain: '#c084fc', preference: '#5ac878', concept: '#ee5a24' };
+    const catColor = { core: '#ff8ad8', movement: '#4aa3ff', learning: '#ffd23f', scoring: '#9fb1c9', brain: '#c084fc', preference: '#5ac878', concept: '#ff6b6b' };
     for (const n of nodes) {
       const p = pos[n.id];
       if (!p) continue;
@@ -1438,7 +1625,7 @@
     // 記錄模式學到的偏好只微調分數（±200），不會蓋掉進化 / 配置招式這些硬規則
     cards.forEach((c, i) => { const s = scoreCard(ns, p, c) + cardBias(c.key); if (s > bestS) { bestS = s; best = i; } });
     // 自主學習探索：偶爾隨機選卡，探索參數空間
-    if (cfg.selfLearn && cfg.on && cfg.exploreRate > 0 && Math.random() < cfg.exploreRate) {
+    if (cfg.selfLearn && cfg.on && cfg.exploreRate > 0 && bestS < 700 && Math.random() < cfg.exploreRate) {   // 只在沒有進化 / 新招 / 補血時才探索
       best = Math.floor(Math.random() * cards.length);
       log('explore pick', cards[best].key);
     }
@@ -1521,7 +1708,7 @@
     if (cfg.orbs && ns.Orbs && p.orbs && now - S.lastOrb > 1500) {
       let around = 0;
       for (const e of ns.EnemyMgr.all()) if (!e.dead && e.behavior !== 'thief' && Math.abs(e.x - p.x) < 90 && Math.abs(e.y - p.y) < 90) around++;
-      const danger = p.hp / p.maxHp < 0.4 || around >= 8;   // 快沒血，或被 8 隻以上的怪貼身包圍
+      const danger = p.hp / p.maxHp < rlp('orbUseHp', 0.4) || around >= Math.round(rlp('orbAround', 8));   // 快沒血，或被 8 隻以上的怪貼身包圍
       const boss = (ns.EnemyMgr.bossAlive && ns.EnemyMgr.bossAlive()) || (ns.Judgment && ns.Judgment.active);
       p.orbs.forEach((o, i) => {
         if (!o || now - S.lastOrb < 1500) return;
@@ -1580,20 +1767,25 @@
     if (!list.length) return null;
     // 只集火「子彈打得到」的怪：被樹 / 石頭 / 牆擋住的不選（不然會為了打牠一直跑去找角度，光球都不撿）
     const W = ns.World;
+    const allList = list.slice(); let clearFn = () => true;
     if (W && W.projectileBlock) {
       const lift = ns.LIFT || 0;
       const clear = c => { const n = Math.ceil(c.d / 16); for (let i = 1; i < n; i++) if (W.projectileBlock(p.x + c.dx * i / n, p.y + c.dy * i / n - lift, 4)) return false; return true; };
+      clearFn = clear;
       list.sort((a, b) => a.d - b.d);
       const vis = list.slice(0, 24).filter(clear);
       if (!vis.length) return null;   // 一隻都打不到：交回遊戲的自動瞄準，走位那邊會去找射擊角度
       list.length = 0; list.push(...vis);
     }
+    // 審判：傳說照出現順序先進先出，打完第一隻再打下一隻（看不到 / 打不動才暫時換）
+    let forced = null;
+    if (judging && cfg.rl && cfg.rl.bossQueue) { try { forced = rlBossForced(ns, p, allList, clearFn); } catch (e) { console.warn('[PSBot] bossQueue', e); } }
     if (judging && arc) list.push(Object.assign(arc, { block: true }));
     const dmg = (m.dmg || 10) * (p.atkFor ? p.atkFor(m) : 1);
     const mult = e => (ns.Types && ns.Types.mult ? ns.Types.mult(m.type, e.types) : 1) * (ns.Weather && ns.Weather.mult ? ns.Weather.mult(m.type) : 1);
     const pierce = (m.pierce | 0) + 1, w = m.size || 6;
-    let best = null, bs = -Infinity;
-    for (const c of list) {
+    let best = forced, bs = -Infinity;
+    for (const c of (forced ? [] : list)) {
       const ux = c.dx / c.d, uy = c.dy / c.d, hits = [];
       if (c.block) continue;
       for (const o of list) {
@@ -1610,6 +1802,7 @@
       }
       if (s > bs) { bs = s; best = c; }
     }
+    if (!best) return null;
     S.focusId = best.e.id; S.focusEnemy = best.e;
     if (!cfg.lead) return Math.atan2(best.e.y - p.y, best.e.x - p.x);
     // 預判：子彈飛過去要 距離 ÷ 子彈速度 秒，怪在動就往牠到時候的位置打（速度用前幾幀的位置估）
@@ -1782,17 +1975,8 @@
     const rift = ns.Rift && ns.Rift.rift;
     // 裂縫只給羈絆。第一組已經綁滿 4 招就不用再進（再拿到羈絆只會被強制綁第二組），省時間也少冒險
     const bondDone = p.slots.some(g => g.length >= 4);
-    const portalHp = (cfg.portal && cfg.portal.enterHp != null) ? cfg.portal.enterHp : 0.7;
-    const portalDist = (cfg.portal && cfg.portal.enterDist != null) ? cfg.portal.enterDist : 300;
-    const nearEnemyDist = (function(){ let d=9999; for(const e of ns.EnemyMgr.all()){ if(e.dead) continue; d=Math.min(d,Math.hypot(e.x-p.x,e.y-p.y)); } return d; })();
-    // 回血池安全評估：周圍敵人距離
-    const springSafeDist = nearEnemyDist;
-    const springSafe = springSafeDist > 150 || hpPct < 0.25;  // 安全距離或緊急
-    const lateGame = (ns.Game.st.time || 0) > 1200;
-    const portalBonus = lateGame ? ((cfg.portal && cfg.portal.lateGameBonus) || 2.0) : 1.0;
-    const portalSafe = hpPct > portalHp && nearEnemyDist > portalDist * 0.5;
-    if (cfg.rift && rift && !ns.Rift.inArena && hpPct > 0.2 && !bondDone && (portalSafe || (cfg.portal && cfg.portal.riskTolerance > 0.7)))
-      out.push({ key: 'rift', tier: 4, x: rift.x, y: rift.y - 10, value: 12 * portalBonus, left: rift.ttl ?? 45, mode: '進裂縫', goalTol: 0, chase: true, direct: true });
+    if (cfg.rift && rift && !ns.Rift.inArena && hpPct > 0.2 && !bondDone)
+      out.push({ key: 'rift', tier: 4, x: rift.x, y: rift.y - 10, value: 12, left: rift.ttl ?? 45, mode: '進裂縫', goalTol: 0, chase: true, direct: true });
     const lost = ns.Events && ns.Events._dbg && ns.Events._dbg();
     if (lost && hpPct > 0.25 && !ns.Rift.inArena) {
       if (lost.state === 'wait') out.push({ key: 'lost', tier: 3, x: lost.x, y: lost.y, value: 8, left: 90, mode: '去救援', goalTol: 1, chase: true });
@@ -1813,7 +1997,7 @@
     if (!ns.Rift.inArena && W && W.specialsNear) for (const o of W.specialsNear(p.x, p.y, 700)) {
       // 祭壇（25 秒 buff：傷害×2 / 速度 / 磁吸×4 / 冷卻-40%）、泉水（回血）、大寶箱（站 3.5 秒開箱）
       if (o.type === 'altar' && !o.used) out.push({ key: 'altar' + o.id, tier: 2, x: o.x, y: o.y, value: 5, left: Infinity, mode: '吃 buff', goalTol: 1, chase: true });
-      else if (o.type === 'spring' && hpPct < (((cfg.steer && cfg.steer.springHp) || 0.6)) && (o.charge ?? 1) > 0.2 && (springSafe || hpPct < 0.25)) out.push({ key: 'spring' + o.id, tier: 2, x: o.x, y: o.y - 8, value: 7, left: Infinity, mode: '泉水回血', goalTol: 0, hold: 20, until: () => p.hp >= p.maxHp * 0.95 });
+      else if (o.type === 'spring' && hpPct < rlp('springHp', (cfg.steer && cfg.steer.springHp) || 0.6) && (o.charge ?? 1) > 0.2) out.push({ key: 'spring' + o.id, tier: 2, x: o.x, y: o.y - 8, value: 7, left: Infinity, mode: '泉水回血', goalTol: 0, hold: 20, until: () => p.hp >= p.maxHp * 0.95 });
       else if (o.type === 'bigchest' && hpPct > 0.5) {
         // 遊戲的判定：站在離寶箱中心 46px 內滿 3.5 秒。寶箱本身是實心的，旁邊又常有樹，
         // 舊版走向寶箱中心、要求 34px 內才停，被樹擋住就一直蹭樹開不到。
@@ -1917,7 +2101,7 @@
       // 那一團的中心進到磁吸範圍就夠了，剩下的會自己飛過來，不用再走過去
       if (left > 0 && d > mag * 0.85 && !(S.farm && d > 440)) return { x: g.x, y: g.y, w: 2, mode: '撿光球', orb: true };
     }
-    let best = null, bestS = 0;
+    let best = null, bestS = 0, bestRk = null;
     const [ox, oy] = S.out || [0, 0];
     // 地上可能有好幾百顆：只拿最近的 120 顆當候選（每團的價值還是用全部的球算）
     const seeds = items.length > 120 ? items.map(k => [Math.hypot(k.x - p.x, k.y - p.y), k]).sort((a, b) => a[0] - b[0]).slice(0, 120).map(x => x[1]) : items;
@@ -1931,12 +2115,16 @@
       for (const e of enemies) if (!e.dead && Math.abs(e.x - k.x) < 70 && Math.abs(e.y - k.y) < 70) crowd += e.boss ? 5 : 1;
       // 順路的稍微加分（同樣價值時先撿前面的，少折返），身後的照樣會去撿
       const ahead = (ox * dx + oy * dy) / (d || 1);
-      const s = cluster / (d + 120) / (1 + crowd * 0.35 * fear) * (1 + 0.3 * ahead);
-      if (s > bestS) { bestS = s; best = k; }
+      let bossN = false;
+      for (const e of enemies) if (e.boss && !e.dead && Math.abs(e.x - k.x) < 260 && Math.abs(e.y - k.y) < 260) { bossN = true; break; }
+      const rk = riskKey(hpPct, crowd, d, !!(ns.Judgment && ns.Judgment.active), bossN);
+      const s = cluster / (d + rlp('orbDistK', 120)) / (1 + crowd * rlp('orbCrowdK', 0.35) * fear) * (1 + 0.3 * ahead) * (1 - riskPenalty(rk));   // 風險表：這種情況撿寶實際掉多少血
+      if (s > bestS) { bestS = s; best = k; bestRk = rk; }
     }
     if (best) {
       const d = Math.hypot(best.x - p.x, best.y - p.y);
       S.orbGoal = { x: best.x, y: best.y, until: gt + 1.5 + 2 * d / pSpd, bestD: d, at: gt };
+      tripStart(bestRk, best.x, best.y);
       return { x: best.x, y: best.y, w: 2, mode: '撿光球', orb: true };
     }
     S.orbGoal = null;
@@ -1964,15 +2152,15 @@
     const hpPct = p.hp / p.maxHp;
     // 血量健康時幾乎不躲小怪（超夢打得死），只躲首領 / 彈幕 / 地面預警；越殘越怕。
     // 門檻與倍率會依「記錄模式學到的人類走位」微調；沒樣本時就是原本的 0.35 / 0.6 / ×1
-    const fm = fearModel(ns);
+    const fm = fearModel();
     let fear = hpPct < fm.low ? 2.5 : hpPct < fm.mid ? 1 : 0.25;
     if (fm.k !== 1) fear *= fm.k;
     // 養怪：手上有範圍招、血量健康時，繞小圈讓怪全部擠在圈裡，範圍招一次打一整團。
     // 怪越多範圍招越賺（貝殼之鈴照傷害回血，打越多回越多），場上 ≥54 隻時新生的怪是精英（經驗 ×1.6）。
     // 血掉到 45% 以下就退回一般走位，回到 65% 再開
     const aoe = p.activeGroup && p.activeGroup().some(m => FARM_KINDS.includes(m.kind));
-    const farmOff = (cfg.steer && cfg.steer.farmHpOff != null) ? cfg.steer.farmHpOff : 0.45;
-    const farmOn = (cfg.steer && cfg.steer.farmHpOn != null) ? cfg.steer.farmHpOn : 0.65;
+    const farmOff = rlp('farmHpOff', (cfg.steer && cfg.steer.farmHpOff != null) ? cfg.steer.farmHpOff : 0.45);
+    const farmOn = rlp('farmHpOn', (cfg.steer && cfg.steer.farmHpOn != null) ? cfg.steer.farmHpOn : 0.65);
     S.farm = cfg.farm && aoe && !(ns.Rift && ns.Rift.inArena) && !(ns.Judgment && ns.Judgment.active) && (S.farm ? hpPct > farmOff : hpPct > farmOn);
     // 養怪時要待在怪群旁邊：小怪的危險度降一點，不然一靠近就切去「躲避」，圈繞不起來。
     // 但不能降太多（v1.8.0 降到 0.08 會直接衝進怪潮邊緣硬扛）；血越少越怕。首領、地面預警照樣躲
@@ -2021,7 +2209,8 @@
     const hazFrac = h => Math.min(1, (h.pct ? Math.max(h.dmg || 0, p.maxHp * h.pct) : (h.dmg || 0)) * (h.pure ? 1 : red) / p.maxHp);
     // 扣 10% 血 ≈ 成本 9~16，血越少越在意。被小怪碰一下（有無敵時間、不會疊加）在血量健康時不太在意，
     // 不然撿光球時每隻迎面走來的怪都會讓人轉頭閃一下又轉回來（抽搐）
-    const DMG_W = hpPct < 0.6 ? 160 : 90, TOUCH_W = S.farm ? (hpPct > 0.8 ? 16 : 24) : hpPct < 0.35 ? 160 : hpPct < 0.6 ? 100 : 30;
+    const _dw = rlp('dmgW', 1), _bR = rlp('bossReach', 90), _aR = rlp('arcReach', 140);
+    const DMG_W = (hpPct < 0.6 ? 160 : 90) * _dw, TOUCH_W = (S.farm ? (hpPct > 0.8 ? 16 : 24) : hpPct < 0.35 ? 160 : hpPct < 0.6 ? 100 : 30) * _dw;
     // 子彈的危險度：養怪時照實際傷害打折（小怪的子彈扣 2% 血只算三成多），痛的（首領）照舊
     const shotW = sh => S.farm ? Math.min(1, 0.2 + 8 * hitFrac(sh.dmg, false)) : 1;
     const danger = (x, y, tAhead) => {
@@ -2032,7 +2221,7 @@
         // 阿爾宙斯在遊戲裡是「傷害 0、速度 0」的假敵人（真正的移動和扣血另外算），要手動當成最危險的首領
         const spd = e.arceus ? pSpd * 1.2 : e.spd || 40, fast = Math.min(2, spd / pSpd);
         const d = Math.hypot(x - e.x, y - e.y) - (e.r || 10) - p.r - spd * tAhead * 0.8;
-        const reach = (e.arceus ? 140 : e.boss ? 90 : 35) + 45 * fast;
+        const reach = (e.arceus ? _aR : e.boss ? _bR : 35) + 45 * fast;
         const w = e.arceus ? 8 : (e.boss ? 4 : 1) * Math.min(3, Math.max(0.5, (e.dmg || 10) / (p.maxHp * 0.12)));
         const v = w * Math.exp(-Math.max(d, -20) / reach);
         if (e.boss || e.arceus) big += v; else c += v;
@@ -2080,17 +2269,11 @@
     const lockedFrom = (x, y) => {
       const fe = cfg.focus && S.focusEnemy && !S.focusEnemy.dead && !S.focusEnemy.arceus ? S.focusEnemy : null;
       if (fe && Math.hypot(fe.x - x, fe.y - y) < 520) return fe;   // 集火中：看的是正在打的那隻
-      let boss = null, bossScore = -Infinity, nearest = null, nd = 520;
+      let boss = null, nearest = null, nd = 520;
       for (const e of aimTargets) {
         if (e.arceus) continue;   // 阿爾宙斯打不死，不為了打牠去換位置（舊版會在牠身邊找射擊角度，直接走過去送死）
         const d = Math.hypot(e.x - x, e.y - y);
-        if (e.boss && d < 330) {
-          // 優先攻擊：血量最低（最容易擊殺）+ 傷害最高（最危險）的 boss
-          // 不是「第一支打完才打第二支」，而是同時考慮所有 boss 的威脅
-          const hpRatio = e.maxHp > 0 ? (e.hp || 0) / e.maxHp : 1;
-          const threat = (e.dmg || 10) * (1 - hpRatio * 0.5) / Math.max(1, d);
-          if (threat > bossScore) { bossScore = threat; boss = e; }
-        }
+        if (e.boss && d < 330) boss = e;
         if (d < nd) { nd = d; nearest = e; }
       }
       return boss || nearest;
@@ -2366,12 +2549,12 @@
         const [dx, dy] = S.jBreakDir;
         if (pathLen(dx, dy, 40) < 24 || (ad < 170 && (ax * dx + ay * dy) / ad > 0.4) || hazardHits(dx, dy) > 0) S.jBreakT = 0;
         else { best = S.jBreakDir; S.mode = '審判：突圍'; }
-      } else if (S.jCenter && hpPct >= 0.5) {
+      } else if (S.jCenter && hpPct >= rlp('jBreakHp', 0.5)) {
         const maxR = (24 - 1.4) * unitPx - p.r - 6;
         const edgeD = Math.hypot(p.x - S.jCenter.x, p.y - S.jCenter.y);
         const legs = near.filter(e => e.boss && !e.arceus && Math.hypot(e.x - p.x, e.y - p.y) < 220);
         const hazNear = hazards.filter(h => !h.hit && inHazard(h, p.x, p.y, 200)).length;
-        if (((edgeD > maxR - 110 && legs.length >= 1) || legs.length >= 3) && hazNear <= 1) {
+        if (((edgeD > maxR - rlp('jBreakEdge', 110) && legs.length >= 1) || legs.length >= 3) && hazNear <= 1) {
           let bd = null, bs = Infinity;
           for (const [dx, dy] of DIRS) {
             const reach = pathLen(dx, dy, 160);
@@ -2605,16 +2788,12 @@
     if (!cfg.on || !cfg.restart || !['ui', 'over'].includes(ns.Game.state)) return;
     const open = id => { const e = document.getElementById(id); return e && !e.classList.contains('hidden'); };
     // 回主選單途中可能跳出的提示，一律按「稍後 / 關閉」
-    if (open('scr-test')) { const opt = document.querySelector('#scr-test button'); if (opt) { opt.click(); return; } }
-    if (open('scr-result')) { const btn = document.querySelector('#scr-result button'); if (btn) { btn.click(); return; } }
-    if (open('scr-login')) { const guest = [...document.querySelectorAll('#scr-login button')].find(b => b.textContent.includes('訪客')); if (guest) { guest.click(); return; } }
     for (const [scr, btn] of [['scr-savenote', 'savenote-ok'], ['scr-news', 'news-close'], ['scr-nick', 'nick-later'], ['scr-recover', 'rec-later']]) {
       if (open(scr)) { document.getElementById(btn)?.click(); return; }
     }
-    if (open('scr-over') || ns.Game.state === 'over') {
-      const btn = document.getElementById('btn-again');
-      if (btn && now() - S.overAt > 4000 && now() - (S.againAt || 0) > 2000) { S.againAt = now(); btn.click(); return; }
-      if (ns.Game.state === 'over') return;
+    if (open('scr-over')) {
+      if (now() - S.overAt > 4000 && now() - (S.againAt || 0) > 2000) { S.againAt = now(); document.getElementById('btn-again')?.click(); }
+      return;
     }
     // 多人：跑完會回到房間（scr-lobby），只有房主能開下一局。
     // 遊戲自己會把 lobby-start 隱藏（訪客）或 disable（人數不足 / 有人還在連線），照它的判斷走就好。
@@ -2754,7 +2933,13 @@
       <button data-k="lockToggle">🔒 鎖定學習</button>
     </div>
   </details>
-  <details data-k="histBox"><summary>戰績（最近 5 局）</summary><div class="st" data-k="hist"></div></details>
+  <details data-k="rlBox" open><summary>🤖 強化學習 / 診斷（死因・學習曲線・撿寶風險）</summary>
+    <label><input type="checkbox" data-r="on">啟用參數強化學習（基準 / +ε / −ε 三局一輪）</label>
+    <label><input type="checkbox" data-r="bossQueue">審判：傳說先進先出（打完第一隻再打下一隻）</label>
+    <div class="row"><button data-k="rlReport">報告→主控台</button><button data-k="rlExport">匯出</button><button data-k="rlReset">重置</button></div>
+    <div class="st" data-k="rlInfo" style="max-height:260px;overflow:auto"></div>
+  </details>
+  <details data-k="histBox"><summary>戰績（最近 10 局）</summary><div class="st" data-k="hist"></div></details>
   <details data-k="brainBox"><summary>🧠 腦知識圖譜（所有參數）</summary>
     <canvas data-k="brainCanvas" width="220" height="180" style="width:100%;border:1px solid #3a4466;border-radius:4px;background:#0a0e1a"></canvas>
     <div class="row"><button data-k="brainExport">匯出腦</button><button data-k="brainImport">匯入腦</button><button data-k="brainRebuild">重建</button></div>
@@ -2786,6 +2971,17 @@
     $('min').onclick = () => { cfg.collapsed = !cfg.collapsed; el.classList.toggle('min', cfg.collapsed); save(); };
     el.querySelectorAll('[data-o]').forEach(i => { i.checked = !!cfg[i.dataset.o]; i.onchange = () => { cfg[i.dataset.o] = i.checked; save(); }; });
 
+    // 強化學習面板
+    el.querySelectorAll('[data-r]').forEach(i => { i.checked = !!cfg.rl[i.dataset.r]; i.onchange = () => { cfg.rl[i.dataset.r] = i.checked; if (i.dataset.r === 'on' && !i.checked) { cfg.rl.cur = null; cfg.rl.active = false; } save(); }; });
+    $('rlReport').onclick = () => console.log(rlReport());
+    $('rlExport').onclick = exportRL;
+    $('rlReset').onclick = () => { if (confirm('重置強化學習？（參數、學習曲線、死因紀錄、撿寶風險表都會清掉）')) resetRL(); };
+    let rlTxt = '', rlAt = 0;
+    function renderRl() {
+      const t = performance.now(); if (t - rlAt < 2000) return; rlAt = t;
+      const txt = rlReport(); if (txt === rlTxt) return; rlTxt = txt;
+      $('rlInfo').replaceChildren(...txt.split('\n').map(s => Object.assign(document.createElement('div'), { textContent: s })));
+    }
     // 記錄模式：開啟後 bot 全部停手，由你自己打；只記錄你的選擇與走位
     function renderRec() {
       const on = !!cfg.record, L = cfg.learn, lm = learnedMove();
@@ -2916,29 +3112,7 @@
       const groups = {};
       for (const n of filtered) { (groups[n.cat] = groups[n.cat] || []).push(n); }
       const lines = [];
-      const curDex = (S.rec && S.rec.dex) || (ns.Game.player && ns.Game.player.dex) || '?';
-      lines.push(`當前寶可夢 dex=${curDex} · 已存 ${Object.keys(cfg.brains||{}).length} 隻的腦 · 節點 ${nodes.length} · 邊 ${ (B.edges||[]).length }`);
-      // 死亡原因統計
-      const dc = cfg.learn.deathCauses || {};
-      const dcTotal = Object.values(dc).reduce((a, b) => a + b, 0);
-      if (dcTotal > 0) {
-        lines.push(`死亡原因: boss=${dc.boss||0} mob=${dc.mob||0} proj=${dc.projectile||0} hazard=${dc.hazard||0} unknown=${dc.unknown||0}`);
-      }
-      // 寶可夢強弱
-      const ps = cfg.learn.pokeStrength || {};
-      const psKeys = Object.keys(ps);
-      if (psKeys.length > 0) {
-        lines.push('寶可夢強弱:');
-        for (const dex of psKeys) {
-          const p = ps[dex];
-          lines.push(`  dex=${dex}: ${p.runs}局 avgTime=${Math.round(p.avgTime)}s avgLv=${p.avgLevel.toFixed(1)} best=${Math.round(p.bestTime)}s`);
-        }
-      }
-      // 獎勵安全
-      const rs = cfg.learn.rewardSafety || {};
-      if ((rs.safe||0)+(rs.unsafe||0) > 0) {
-        lines.push(`獎勵安全: safe=${rs.safe||0} unsafe=${rs.unsafe||0} died=${rs.died||0}`);
-      }
+      lines.push(`節點 ${nodes.length} · 邊 ${ (B.edges||[]).length } · ⚠ 僅視覺化，不影響 bot 行為（真正的學習在「強化學習」區塊）`);
       for (const cat of BRAIN_CATS) {
         const ns = groups[cat];
         if (!ns || !ns.length) continue;
@@ -3054,6 +3228,7 @@
 
     setInterval(() => {
       renderRec();
+      try { renderRl(); } catch (e) {}
       try { renderDash(); } catch (e) {}
       renderBuild(false);
       const p = ns.Game.player, inRun = p && ns.Game.state !== 'ui';
@@ -3067,7 +3242,7 @@
       const mmss = t => `${Math.floor((t || 0) / 60)}:${String(Math.floor((t || 0) % 60)).padStart(2, '0')}`;
       const runLine = h => `${mmss(h.time)} Lv${h.level} · 擊倒 ${h.kills} · 金幣 ${h.coins}${h.record ? ' · 新紀錄' : ''}` +
         (h.judge ? `\n　審判 ${mmss(h.judge.time)} · ${h.judge.bosses} 隻傳說 · 傷害 ${(h.judge.dmg || 0).toLocaleString()}` : '');
-      const hist = (cfg.history || []).slice(0, 5).flatMap(h => runLine(h).split('\n'));
+      const hist = (cfg.history || []).slice(0, 10).flatMap(h => runLine(h).split('\n'));
       if ($('hist').childElementCount !== hist.length || $('hist').textContent !== hist.join('')) $('hist').replaceChildren(...(hist.length ? hist : ['還沒有完成的局']).map(t => Object.assign(document.createElement('div'), { textContent: t })));
     }, 500);
   }
