@@ -19,7 +19,7 @@
   try { Object.defineProperty(window, GUARD, { value: 1, configurable: true }); } catch { window[GUARD] = 1; }
 
   const STORE_KEY = 'psbot.v1';
-  const VERSION = '4.1.0';   // v4.1：真正的參數強化學習（SPSA）+ 飛行記錄器 + 撿寶風險表 + 傳說先進先出佇列
+  const VERSION = '10.0.0';   // v4.1：真正的參數強化學習（SPSA）+ 飛行記錄器 + 撿寶風險表 + 傳說先進先出佇列
   const log = (...a) => console.log('%c[PSBot]', 'color:#ff8ad8', ...a);
   let capturedNs = null;
 
@@ -212,6 +212,7 @@
     brain: { v: 1, nodes: {}, edges: [], updatedAt: 0 },
     // AI 自主學習：bot 自己打時也記錄並更新腦（不只學人類）
     selfLearn: true,
+    buffFarmAfterMaxed: true,
     exploreRate: 0.05,
     // 強化學習 v2：參數搜尋 + 死因記錄 + 撿寶風險 + 傳說佇列（詳見 RL 區塊）
     rl: { on: true, bossQueue: true, sigma: 0.12, lr: 0.5, w: { surv: 1, jt: 1.5, jb: 0.5, lv: 0.15, kl: 0.1 },
@@ -266,6 +267,7 @@
   if (!cfg.brain.nodes || typeof cfg.brain.nodes !== 'object') cfg.brain.nodes = {};
   if (!Array.isArray(cfg.brain.edges)) cfg.brain.edges = [];
   cfg.selfLearn = (cfg.selfLearn !== undefined) ? !!cfg.selfLearn : true;
+  cfg.buffFarmAfterMaxed = (cfg.buffFarmAfterMaxed !== undefined) ? !!cfg.buffFarmAfterMaxed : true;
   cfg.rl = Object.assign(JSON.parse(JSON.stringify(DEFAULTS.rl)), cfg.rl || {});
   cfg.statPri = Object.assign({}, DEFAULTS.statPri, cfg.statPri || {});
   cfg.kindPri = Object.assign({}, DEFAULTS.kindPri, cfg.kindPri || {});
@@ -1168,6 +1170,7 @@
     { id: 'cfg.passiveFirst', label: '被動優先', cat: 'core', type: 'bool', def: true, desc: '被動>招式' },
     { id: 'cfg.record', label: '記錄模式', cat: 'core', type: 'bool', def: false, desc: '人類示範' },
     { id: 'cfg.selfLearn', label: '自主學習', cat: 'core', type: 'bool', def: true, desc: 'bot 自己學' },
+    { id: 'cfg.buffFarmAfterMaxed', label: 'BUFF農場', cat: 'core', type: 'bool', def: true, desc: '滿等後狂刷BUFF' },
     { id: 'cfg.exploreRate', label: '探索率', cat: 'brain', type: 'number', def: 0.05, min: 0, max: 0.3, step: 0.01, desc: 'epsilon-greedy 探索' },
     // --- 移動 / 戰鬥 ---
     { id: 'steer.fearLow', label: '恐懼門檻(低血)', cat: 'movement', type: 'number', def: 0.35, min: 0.15, max: 0.6, step: 0.01, humanTrackable: true, humanSource: 'learn.params.fearLow', desc: '低血量時恐懼係數切換點' },
@@ -1621,9 +1624,24 @@
   function chooseCard(ns, cards) {
     const p = ns.Game.player;
     if (!p || !ns.UI.isOpen('scr-levelup')) return;
+    const allSlotsFull = p.slots.length >= 4 && p.slots.every(g => g.length >= 1);
+    const allMaxed = p.slots.every(g => g.every(m => !m || m.evolved || (m.lvl || 0) >= ((m.def && m.def.maxLvl) || 5)));
+    const maxedState = allSlotsFull && allMaxed;
     let best = 0, bestS = -Infinity;
     // 記錄模式學到的偏好只微調分數（±200），不會蓋掉進化 / 配置招式這些硬規則
-    cards.forEach((c, i) => { const s = scoreCard(ns, p, c) + cardBias(c.key); if (s > bestS) { bestS = s; best = i; } });
+    // BUFF 農場模式：4 技能滿等 + 底下技能槽滿 → 優先 stat 卡（BUFF），不再進裂縫
+    const buffFarm = maxedState && (cfg.buffFarmAfterMaxed !== false);
+    cards.forEach((c, i) => {
+      let s = scoreCard(ns, p, c) + cardBias(c.key);
+      if (buffFarm && c.type === 'stat') s += 300;   // BUFF 農場：stat 卡 +300
+      if (buffFarm && c.type === 'new') s -= 500;     // BUFF 農場：新技能 -500
+      if (buffFarm && c.type === 'up') {
+        const m = p.moves.find(x => x.id === c.key.split(':')[1]);
+        const maxLvl = (m && m.def && m.def.maxLvl) || 5;
+        if (m && (m.lvl || 0) >= maxLvl) s -= 400;   // 已滿等的 up 卡 -400
+      }
+      if (s > bestS) { bestS = s; best = i; }
+    });
     // 自主學習探索：偶爾隨機選卡，探索參數空間
     if (cfg.selfLearn && cfg.on && cfg.exploreRate > 0 && bestS < 700 && Math.random() < cfg.exploreRate) {   // 只在沒有進化 / 新招 / 補血時才探索
       best = Math.floor(Math.random() * cards.length);
@@ -1975,7 +1993,14 @@
     const rift = ns.Rift && ns.Rift.rift;
     // 裂縫只給羈絆。第一組已經綁滿 4 招就不用再進（再拿到羈絆只會被強制綁第二組），省時間也少冒險
     const bondDone = p.slots.some(g => g.length >= 4);
-    if (cfg.rift && rift && !ns.Rift.inArena && hpPct > 0.2 && !bondDone)
+    // 使用者策略：4 個技能都點滿 + 底下技能槽滿 → 停止進裂縫，狂刷 BUFF
+    const allSlotsFull = p.slots.length >= 4 && p.slots.every(g => g.length >= 1);
+    const allMaxed = p.slots.every(g => g.every(m => !m || m.evolved || (m.lvl || 0) >= ((m.def && m.def.maxLvl) || 5)));
+    const maxedState = allSlotsFull && allMaxed;
+    const timeMin = (ns.Game.st.time || 0) / 60;
+    // 傳送門策略：30 分鐘前或未滿等時進裂縫疊技能；滿等後不再進
+    const shouldEnterRift = cfg.rift && !maxedState && (timeMin < 30 || !allSlotsFull);
+    if (shouldEnterRift && rift && !ns.Rift.inArena && hpPct > 0.2 && !bondDone)
       out.push({ key: 'rift', tier: 4, x: rift.x, y: rift.y - 10, value: 12, left: rift.ttl ?? 45, mode: '進裂縫', goalTol: 0, chase: true, direct: true });
     const lost = ns.Events && ns.Events._dbg && ns.Events._dbg();
     if (lost && hpPct > 0.25 && !ns.Rift.inArena) {
