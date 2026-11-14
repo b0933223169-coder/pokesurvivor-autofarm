@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "PokéSurvivor 自動掛機",
+  "version": "11.0.0",
+  "description": "PokéSurvivor 自動走位、自動選卡、自動羈絆、自動再來一局。",
+  "content_scripts": [
+    {
+      "matches": [
+        "https://pokesurvivor.com/*",
+        "https://www.pokesurvivor.com/*"
+      ],
+      "js": [
+        "inject.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    }
+  ]
+}
